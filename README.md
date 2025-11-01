@@ -1,3 +1,1 @@
-"# sasd" 
-"# sasd" 
 # tkinterbit
