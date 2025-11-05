@@ -1309,817 +1309,1632 @@ def close_position_market(symbol, side, usd_amount, account_num=1):
 def symbol_worker(symbol):
     """
     Робота по одному символу з усередненням позицій: fetch ticker, dex price via dexscreener, calc spread, check liquidity, open/average/close
+    (ОДИН ПРОХІД ЗАМІСТЬ ЦИКЛУ)
     """
-    logging.info("Worker started for %s", symbol)
-    while bot_running:
+    logging.info(f"Worker starting for {symbol}") # ⬅️ ЗМІНЕНО: логування старту
+    # ⛔️ ВИДАЛЕНО: while bot_running:
+    try:
+        if not trade_symbols.get(symbol, False):
+            # time.sleep(1) # ⛔️ ВИДАЛЕНО
+            logging.debug(f"[{symbol}] Торгівля вимкнена, воркер завершує роботу.")
+            return  # ⬅️ ЗМІНЕНО: з continue на return
+
+        # 1) ТІЛЬКИ XT БІРЖА - отримуємо ціну з XT (як просив користувач)
+        xt_price = None
+        if not (xt_markets_available and xt):
+            logging.debug(f"[{symbol}] ❌ XT біржа недоступна")
+            return  # ⬅️ ЗМІНЕНО: з continue на return
+            
         try:
-            if not trade_symbols.get(symbol, False):
-                time.sleep(1)
-                continue
+            xt_price = get_xt_price(xt, symbol)
+            if not xt_price or not is_xt_futures_tradeable(symbol):
+                logging.debug(f"[{symbol}] ❌ Неможливо торгувати на XT futures")
+                return  # ⬅️ ЗМІНЕНО: з continue на return
+            logging.debug(f"[{symbol}] ✅ XT ціна: ${xt_price:.6f}")
+        except Exception as e:
+            logging.debug(f"[{symbol}] ⚠️ XT ціна недоступна: {e}")
+            return  # ⬅️ ЗМІНЕНО: з continue на return
 
-            # 1) ТІЛЬКИ XT БІРЖА - отримуємо ціну з XT (як просив користувач)
-            xt_price = None
-            if not (xt_markets_available and xt):
-                logging.debug(f"[{symbol}] ❌ XT біржа недоступна")
-                time.sleep(SCAN_INTERVAL)
-                continue
+        # 2) ТІЛЬКИ ТОДІ DexScreener - отримуємо РОЗШИРЕНІ МЕТРИКИ
+        try:
+            # 🔬 РОЗШИРЕНИЙ АНАЛІЗ: ліквідність, FDV, market cap, транзакції, покупці/продавці
+            advanced_metrics = get_advanced_token_analysis(symbol)
+            if not advanced_metrics:
+                logging.debug(f"[{symbol}] ❌ Немає якісної пари на DexScreener")
+                return  # ⬅️ ЗМІНЕНО: з continue на return
                 
-            try:
-                xt_price = get_xt_price(xt, symbol)
-                if not xt_price or not is_xt_futures_tradeable(symbol):
-                    logging.debug(f"[{symbol}] ❌ Неможливо торгувати на XT futures")
-                    time.sleep(SCAN_INTERVAL)
-                    continue
-                logging.debug(f"[{symbol}] ✅ XT ціна: ${xt_price:.6f}")
-            except Exception as e:
-                logging.debug(f"[{symbol}] ⚠️ XT ціна недоступна: {e}")
-                time.sleep(SCAN_INTERVAL)
-                continue
+            # Отримуємо базові дані (backward compatibility)
+            token_info = {
+                'price_usd': advanced_metrics.get('price_usd', 0),
+                'liquidity': advanced_metrics.get('liquidity', 0),
+                'volume_24h': advanced_metrics.get('volume_24h', 0),
+                'dex_link': advanced_metrics.get('exact_pair_url') or get_proper_dexscreener_link(symbol)
+            }
+            
+            # Коротка інформація про токен (зменшено логування)
+            logging.info(f"📊 {symbol}: ${advanced_metrics.get('price_usd', 0):.6f} | Vol ${advanced_metrics.get('volume_1h', 0):,.0f}")
+                
+            if not token_info:
+                logging.debug(f"[{symbol}] ❌ Немає якісної пари на DexScreener")
+                return  # ⬅️ ЗМІНЕНО: з continue на return
+            
+            dex_price = token_info['price_usd']
+            
+            # ЖОРСТКІ ПЕРЕВІРКИ (як у топових арбітражних ботів)
+            if not dex_price or dex_price < 0.000001:  # мінімальна ціна $0.000001
+                raise Exception(f"Invalid DexScreener price: {dex_price}")
+                
+        except Exception as e:
+            # БЛОКУЄМО токени з поганими DexScreener цінами - як у друга з Bybit
+            logging.warning(f"[{symbol}] ❌ Пропускаємо через погану DexScreener ціну: {e}")
+            return  # ⬅️ ЗМІНЕНО: з continue на return
 
-            # 2) ТІЛЬКИ ТОДІ DexScreener - отримуємо РОЗШИРЕНІ МЕТРИКИ як у російської системи!
-            try:
-                # 🔬 РОЗШИРЕНИЙ АНАЛІЗ: ліквідність, FDV, market cap, транзакції, покупці/продавці
-                advanced_metrics = get_advanced_token_analysis(symbol)
-                if not advanced_metrics:
-                    logging.debug(f"[{symbol}] ❌ Немає якісної пари на DexScreener")
-                    time.sleep(SCAN_INTERVAL)
-                    continue
+        # 3) ТІЛЬКИ XT vs DexScreener АРБІТРАЖ (Gate.io ВІДКЛЮЧЕНО)
+        if not xt_price:
+            logging.debug(f"[{symbol}] ❌ XT ціна недоступна")
+            return  # ⬅️ ЗМІНЕНО: з continue на return
+            
+        # Розраховуємо спред XT vs DexScreener
+        xt_dex_spread = calculate_spread(dex_price, xt_price)
+        best_spread = xt_dex_spread
+        best_direction = "LONG" if xt_price < dex_price else "SHORT" 
+        best_exchange_pair = "XT vs Dex"
+        trading_exchange = "xt"  # ЗАВЖДИ торгуємо на XT
+        ref_price = xt_price  # ВИПРАВЛЕНО: XT ціна для XT біржі
+        
+        spread_pct = best_spread
+        spread_store.append(spread_pct)
+        
+        # Покращене логування тільки з XT та DexScreener
+        clean_symbol = symbol.replace('/USDT:USDT', '')
+        log_info = f"XT: ${xt_price:.6f} | Dex: ${dex_price:.6f} | Спред: {best_spread:.2f}% {best_direction} | Торгуємо на: XT"
+        logging.info(f"[{clean_symbol}] {log_info}")
+        
+        # 🚀 НОВІ ФІШКИ: Розумна аналітика ПІСЛЯ встановлення trading_exchange
+        volatility = calculate_volatility_indicator(symbol, trading_exchange)
+        volume_analysis = analyze_volume_quality(symbol, token_info, trading_exchange)
+        smart_timing = smart_entry_timing(symbol, abs(spread_pct), volatility, volume_analysis)
+        
+        # Логування нових фішок
+        # Аналіз якості токена (логування зменшено)
+        if volatility.get('status') == 'success' and smart_timing.get('status') == 'success':
+            logging.info(f"[{clean_symbol}] 📊 Волатільність: {volatility['volatility']}% | Тайминг: {smart_timing['grade']}")
+        
+        # ✅ ПОВНА АВТОМАТИЗАЦІЯ - БЕЗ БЛОКИРОВОК!
+        enhanced_entry_check = True
+        
+        # Інформаційні повідомлення (БЕЗ БЛОКУВАННЯ!)
+        # Попередження тільки для критичних випадків
+        if volatility.get('risk_level') == 'EXTREME' and volatility.get('volatility', 0) > 30:
+            logging.info(f"[{clean_symbol}] ⚠️ Висока волатільність {volatility.get('volatility', 0)}% - торгуємо обережно")
+        
+        # НЕ спамимо про кожну арбітражну можливість - тільки про реальні торгові операції
+
+        # 3) Перевірка балансу перед торгівлею
+        # МАРЖА ЗА НАЛАШТУВАННЯМ (збільшено для торгівлі дорожчими токенами)
+        required_margin = float(ORDER_AMOUNT)  # Примусове приведення до float
+        
+        # 🔒 THREAD-SAFE БАЛАНС (Task 6: захист від одночасних перевірок балансу)
+        try:
+            with balance_check_lock:  # ЗАХИСТ: тільки один worker перевіряє баланс одночасно
+                # Видалено DEBUG логування для чистоти
+                
+                # ✅ ТІЛЬКИ XT.COM БІРЖА - ОБИДВА АКАУНТИ
+                if trading_exchange == "xt":
+                    # Баланс акаунта 1
+                    balance_1 = get_xt_futures_balance(xt_account_1)
+                    available_balance_1 = float(balance_1.get('free', 0.0))
+                    # Баланс акаунта 2
+                    balance_2 = get_xt_futures_balance(xt_account_2)
+                    available_balance_2 = float(balance_2.get('free', 0.0))
+                    # Загальний доступний баланс
+                    available_balance = available_balance_1 + available_balance_2
+                    logging.info(f"💰 XT.com АКАУНТ 1: ${balance_1['total']:.2f} USDT (доступно ${available_balance_1:.2f})")
+                    logging.info(f"💰 XT.com АКАУНТ 2: ${balance_2['total']:.2f} USDT (доступно ${available_balance_2:.2f})")
+                    logging.info(f"💰 ЗАГАЛОМ: ${balance_1['total'] + balance_2['total']:.2f} USDT (доступно ${available_balance:.2f})")
+                else:
+                    # Якщо trading_exchange не XT - пропускаємо
+                    logging.warning(f"[{symbol}] ⚠️ Підтримуємо тільки XT біржу, пропускаємо: {trading_exchange}")
+                    return  # ⬅️ ЗМІНЕНО: з continue на return
                     
-                # Отримуємо базові дані (backward compatibility)
-                token_info = {
-                    'price_usd': advanced_metrics.get('price_usd', 0),
-                    'liquidity': advanced_metrics.get('liquidity', 0),
-                    'volume_24h': advanced_metrics.get('volume_24h', 0),
-                    'dex_link': advanced_metrics.get('exact_pair_url') or get_proper_dexscreener_link(symbol)
+                # Детальне логування умов торгівлі
+                spread_check = MIN_SPREAD <= abs(spread_pct) <= MAX_SPREAD
+                balance_check = available_balance >= required_margin
+                
+                # 🔒 Перевірка кількості активних позицій з ЗАХИСТОМ (поза balance_check_lock)
+                with active_positions_lock:
+                    total_positions = len(active_positions)
+                    has_position = symbol in active_positions
+                positions_check = total_positions < MAX_OPEN_POSITIONS
+            
+            
+            # 🔥 ПОКРАЩЕНІ ФІЛЬТРИ РЕАЛЬНОСТІ - відсіюємо фейкові арбітражі!
+            is_realistic = True
+            
+            # 1. РОЗУМНИЙ спред фільтр: різні ліміти для різних монет
+            clean_symbol = symbol.replace('/USDT:USDT', '')
+            
+            # Основні монети (ETH, BTC тощо) - більш жорсткі ліміти
+            major_tokens = ['ETH', 'BTC', 'BNB', 'ADA', 'SOL', 'MATIC', 'AVAX', 'DOT', 'LINK']
+            max_spread_limit = 50.0  # ПОЛІПШЕНО: максимум 50% для блокування фейків
+            
+            # ЖОРСТКА перевірка фейкових спредів  
+            if abs(spread_pct) > max_spread_limit:
+                logging.warning(f"[{symbol}] ❌ ФЕЙК: Нереальний спред {spread_pct:.2f}% > {max_spread_limit}%")
+                is_realistic = False
+            
+            # БЛОКУВАННЯ НЕГАТИВНИХ СПРЕДІВ (очевидні фейки)
+            if spread_pct < -25.0:  # Негативні спреди більше -25% завжди фейкові  
+                logging.warning(f"[{symbol}] ❌ ФЕЙК: Негативний спред {spread_pct:.2f}% заблоковано")
+                is_realistic = False
+            
+            # 2. РОЗСЛАБЛЕНА перевірка співвідношення цін для більше можливостей
+            price_ratio = max(xt_price, dex_price) / min(xt_price, dex_price)
+            max_price_ratio = 2.5  # РОЗСЛАБЛЕНО: 2.5x для всіх монет для більше сигналів
+            
+            if price_ratio > max_price_ratio:
+                logging.warning(f"[{symbol}] ❌ ФЕЙК: Ціни відрізняються в {price_ratio:.2f} разів (макс. {max_price_ratio:.1f}x)")
+                is_realistic = False
+            
+            # 3. АБСОЛЮТНА перевірка цін для топ-монет (як ETH $3701 vs $4601)  
+            if clean_symbol in major_tokens:
+                # Перевіряємо що цінди в розумних межах для топ-монет
+                expected_ranges = {
+                    'ETH': (2000, 6000),    # ETH очікується $2000-6000
+                    'BTC': (30000, 100000), # BTC очікується $30k-100k  
+                    'BNB': (200, 1000),     # BNB очікується $200-1000
+                    'SOL': (50, 500),       # SOL очікується $50-500
+                    'ADA': (0.2, 3.0),      # ADA очікується $0.2-3.0
                 }
                 
-                # Коротка інформація про токен (зменшено логування)
-                logging.info(f"📊 {symbol}: ${advanced_metrics.get('price_usd', 0):.6f} | Vol ${advanced_metrics.get('volume_1h', 0):,.0f}")
-                    
-                if not token_info:
-                    logging.debug(f"[{symbol}] ❌ Немає якісної пари на DexScreener")
-                    time.sleep(SCAN_INTERVAL)
-                    continue
-                
-                dex_price = token_info['price_usd']
-                
-                # ЖОРСТКІ ПЕРЕВІРКИ (як у топових арбітражних ботів)
-                if not dex_price or dex_price < 0.000001:  # мінімальна ціна $0.000001
-                    raise Exception(f"Invalid DexScreener price: {dex_price}")
-                    
-            except Exception as e:
-                # БЛОКУЄМО токени з поганими DexScreener цінами - як у друга з Bybit
-                logging.warning(f"[{symbol}] ❌ Пропускаємо через погану DexScreener ціну: {e}")
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            # 3) ТІЛЬКИ XT vs DexScreener АРБІТРАЖ (Gate.io ВІДКЛЮЧЕНО)
-            if not xt_price:
-                logging.debug(f"[{symbol}] ❌ XT ціна недоступна")
-                time.sleep(SCAN_INTERVAL)
-                continue
-                
-            # Розраховуємо спред XT vs DexScreener
-            xt_dex_spread = calculate_spread(dex_price, xt_price)
-            best_spread = xt_dex_spread
-            best_direction = "LONG" if xt_price < dex_price else "SHORT" 
-            best_exchange_pair = "XT vs Dex"
-            trading_exchange = "xt"  # ЗАВЖДИ торгуємо на XT
-            ref_price = xt_price  # ВИПРАВЛЕНО: XT ціна для XT біржі
+                if clean_symbol in expected_ranges:
+                    min_price, max_price = expected_ranges[clean_symbol]
+                    if not (min_price <= xt_price <= max_price) or not (min_price <= dex_price <= max_price):
+                        logging.warning(f"[{symbol}] ❌ ФЕЙК: Ціна поза межами для {clean_symbol}: XT=${xt_price:.2f}, Dex=${dex_price:.2f} (очікується ${min_price}-${max_price})")
+                        is_realistic = False
             
-            spread_pct = best_spread
-            spread_store.append(spread_pct)
+            # 4. ЖОРСТКІ ФІЛЬТРИ: Мінімальна ліквідність та обсяг для торгівлі (як просив користувач)
+            min_liquidity = token_info.get('liquidity', 0)
+            min_volume_24h = token_info.get('volume_24h', 0)
             
-            # Покращене логування тільки з XT та DexScreener
-            clean_symbol = symbol.replace('/USDT:USDT', '')
-            log_info = f"XT: ${xt_price:.6f} | Dex: ${dex_price:.6f} | Спред: {best_spread:.2f}% {best_direction} | Торгуємо на: XT"
-            logging.info(f"[{clean_symbol}] {log_info}")
+            if min_liquidity < MIN_POOLED_LIQUIDITY_USD:  # ФІЛЬТР з config.py
+                logging.warning(f"[{symbol}] ❌ ФЕЙК: Мала ліквідність ${min_liquidity:,.0f} < ${MIN_POOLED_LIQUIDITY_USD:,}")
+                is_realistic = False
+                
+            if min_volume_24h < MIN_24H_VOLUME_USD:  # ФІЛЬТР з config.py
+                logging.warning(f"[{symbol}] ❌ ФЕЙК: Малий обсяг ${min_volume_24h:,.0f} < ${MIN_24H_VOLUME_USD:,}")
+                is_realistic = False
             
-            # 🚀 НОВІ ФІШКИ: Розумна аналітика ПІСЛЯ встановлення trading_exchange
-            volatility = calculate_volatility_indicator(symbol, trading_exchange)
-            volume_analysis = analyze_volume_quality(symbol, token_info, trading_exchange)
-            smart_timing = smart_entry_timing(symbol, abs(spread_pct), volatility, volume_analysis)
+            # 5. Перевіряємо що це не стейблкоїн або заблоковані токени
+            blacklisted_tokens = ['USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'FDUSD', 'TON']
+            if any(token in clean_symbol for token in blacklisted_tokens):
+                logging.info(f"[{symbol}] ❌ ЗАБЛОКОВАНО: Токен {clean_symbol} в чорному списку")
+                is_realistic = False
+            
+            # 6. ДОДАТКОВО: Перевірка кратності цін (виявляє деякі фейки)
+            if xt_price > 0 and dex_price > 0:
+                # Якщо одна ціна є точним кратним іншої (x10, x100), це може бути помилка
+                ratio_check = xt_price / dex_price
+                if abs(ratio_check - round(ratio_check)) < 0.01 and round(ratio_check) >= 10:
+                    logging.warning(f"[{symbol}] ❌ ФЕЙК: Підозрюване кратне співвідношення цін {ratio_check:.1f}x")
+                    is_realistic = False
+            
+            # АВТОСИГНАЛИ: Окремі сигнали для кожної пари бірж >= MIN_SPREAD
             
             # Логування нових фішок
-            # Аналіз якості токена (логування зменшено)
-            if volatility.get('status') == 'success' and smart_timing.get('status') == 'success':
-                logging.info(f"[{clean_symbol}] 📊 Волатільність: {volatility['volatility']}% | Тайминг: {smart_timing['grade']}")
+            if volatility.get('status') == 'success':
+                # Компактний звіт якості (зменшено логування)
+                if volatility.get('status') == 'success' and volume_analysis.get('status') == 'success':
+                    logging.info(f"[{symbol}] 📊 Vol: {volatility['volatility']}% | Об'єм: ${volume_analysis['total_volume']:,.0f} | Тайминг: {smart_timing.get('grade', 'N/A')}")
             
-            # ✅ ПОВНА АВТОМАТИЗАЦІЯ - БЕЗ БЛОКИРОВОК!
+            # Підвищуємо вимоги до входу на основі нових фішок
             enhanced_entry_check = True
             
-            # Інформаційні повідомлення (БЕЗ БЛОКУВАННЯ!)
-            # Попередження тільки для критичних випадків
-            if volatility.get('risk_level') == 'EXTREME' and volatility.get('volatility', 0) > 30:
-                logging.info(f"[{clean_symbol}] ⚠️ Висока волатільність {volatility.get('volatility', 0)}% - торгуємо обережно")
+            # 🎯 ДОЗВОЛЕНО: Блокування тільки найгірших сигналів (дозволяємо FAIR тайминг)
+            timing_recommendation = smart_timing.get('recommendation', 'WAIT')
+            if timing_recommendation in ['SKIP_SIGNAL']:  # Тільки SKIP_SIGNAL, WAIT/CONSIDER дозволені
+                logging.warning(f"[{symbol}] ❌ БЛОКОВАНИЙ СИГНАЛ: таймінг {smart_timing.get('grade')} ({smart_timing.get('timing_score', 0)} балів)")
+                enhanced_entry_check = False  # БЛОКУЄМО тільки найгірші сигнали
             
-            # НЕ спамимо про кожну арбітражну можливість - тільки про реальні торгові операції
+            # Блокуємо при екстремальній волатильності
+            if volatility.get('risk_level') == 'EXTREME':
+                logging.info(f"[{symbol}] 📊 ІНФО: Висока волатільність {volatility.get('volatility', 0)}% але торгуємо далі")
+                # БЕЗ БЛОКУВАННЯ enhanced_entry_check залишається True
+            
+            # Блокуємо при низькому об'ємі
+            if volume_analysis.get('quality_score', 0) <= 1:
+                logging.warning(f"[{symbol}] 📈 БЛОКОВАНО: Занадто низький об'єм ${volume_analysis.get('total_volume', 0):,.0f}")
+                enhanced_entry_check = False
+            
+            # 🛡️ ПЕРЕВІРЯЄМО ІСНУЮЧІ ПОЗИЦІЇ ПЕРЕД ВІДПРАВКОЮ СИГНАЛІВ
+            with active_positions_lock:
+                already_has_position = symbol in active_positions
 
-            # 3) Перевірка балансу перед торгівлею
-            # МАРЖА ЗА НАЛАШТУВАННЯМ (збільшено для торгівлі дорожчими токенами)
-            required_margin = float(ORDER_AMOUNT)  # Примусове приведення до float
-            
-            # 🔒 THREAD-SAFE БАЛАНС (Task 6: захист від одночасних перевірок балансу)
-            try:
-                with balance_check_lock:  # ЗАХИСТ: тільки один worker перевіряє баланс одночасно
-                    # Видалено DEBUG логування для чистоти
-                    
-                    # ✅ ТІЛЬКИ XT.COM БІРЖА - ОБИДВА АКАУНТИ
-                    if trading_exchange == "xt":
-                        # Баланс акаунта 1
-                        balance_1 = get_xt_futures_balance(xt_account_1)
-                        available_balance_1 = float(balance_1.get('free', 0.0))
-                        # Баланс акаунта 2
-                        balance_2 = get_xt_futures_balance(xt_account_2)
-                        available_balance_2 = float(balance_2.get('free', 0.0))
-                        # Загальний доступний баланс
-                        available_balance = available_balance_1 + available_balance_2
-                        logging.info(f"💰 XT.com АКАУНТ 1: ${balance_1['total']:.2f} USDT (доступно ${available_balance_1:.2f})")
-                        logging.info(f"💰 XT.com АКАУНТ 2: ${balance_2['total']:.2f} USDT (доступно ${available_balance_2:.2f})")
-                        logging.info(f"💰 ЗАГАЛОМ: ${balance_1['total'] + balance_2['total']:.2f} USDT (доступно ${available_balance:.2f})")
-                    else:
-                        # Якщо trading_exchange не XT - пропускаємо
-                        logging.warning(f"[{symbol}] ⚠️ Підтримуємо тільки XT біржу, пропускаємо: {trading_exchange}")
-                        continue
-                        
-                    # Детальне логування умов торгівлі
-                    spread_check = abs(spread_pct) >= MIN_SPREAD
-                    balance_check = available_balance >= required_margin
-                    
-                    # 🔒 Перевірка кількості активних позицій з ЗАХИСТОМ (поза balance_check_lock)
+            # 🎯 НОВА ЛОГІКА: ЗБИРАЄМО МОЖЛИВОСТІ БЕЗ БАЛАНСОВИХ ОБМЕЖЕНЬ ДЛЯ НАЙКРАЩИХ СИГНАЛІВ
+            logging.info(f"🔍 ПЕРЕВІРКА СИГНАЛУ {symbol}: realistic={is_realistic}, entry_check={enhanced_entry_check}, has_position={already_has_position}")
+            if is_realistic and enhanced_entry_check and not already_has_position:
+                # 1. XT vs DexScreener (ТІЛЬКИ XT БІРЖА)
+                xt_dex_spread_pct = calculate_spread(dex_price, xt_price)
+                if MIN_SPREAD <= abs(xt_dex_spread_pct) <= MAX_SPREAD:
+                    # ✅ Перевіряємо ліміт відкритих позицій
                     with active_positions_lock:
-                        total_positions = len(active_positions)
-                        has_position = symbol in active_positions
-                    positions_check = total_positions < MAX_OPEN_POSITIONS
-                
-                
-                # 🔥 ПОКРАЩЕНІ ФІЛЬТРИ РЕАЛЬНОСТІ - відсіюємо фейкові арбітражі!
-                is_realistic = True
-                
-                # 1. РОЗУМНИЙ спред фільтр: різні ліміти для різних монет
-                clean_symbol = symbol.replace('/USDT:USDT', '')
-                
-                # Основні монети (ETH, BTC тощо) - більш жорсткі ліміти
-                major_tokens = ['ETH', 'BTC', 'BNB', 'ADA', 'SOL', 'MATIC', 'AVAX', 'DOT', 'LINK']
-                max_spread_limit = 50.0  # ПОЛІПШЕНО: максимум 50% для блокування фейків
-                
-                # ЖОРСТКА перевірка фейкових спредів  
-                if abs(spread_pct) > max_spread_limit:
-                    logging.warning(f"[{symbol}] ❌ ФЕЙК: Нереальний спред {spread_pct:.2f}% > {max_spread_limit}%")
-                    is_realistic = False
-                
-                # БЛОКУВАННЯ НЕГАТИВНИХ СПРЕДІВ (очевидні фейки)
-                if spread_pct < -25.0:  # Негативні спреди більше -25% завжди фейкові  
-                    logging.warning(f"[{symbol}] ❌ ФЕЙК: Негативний спред {spread_pct:.2f}% заблоковано")
-                    is_realistic = False
-                
-                # 2. РОЗСЛАБЛЕНА перевірка співвідношення цін для більше можливостей
-                price_ratio = max(xt_price, dex_price) / min(xt_price, dex_price)
-                max_price_ratio = 2.5  # РОЗСЛАБЛЕНО: 2.5x для всіх монет для більше сигналів
-                
-                if price_ratio > max_price_ratio:
-                    logging.warning(f"[{symbol}] ❌ ФЕЙК: Ціни відрізняються в {price_ratio:.2f} разів (макс. {max_price_ratio:.1f}x)")
-                    is_realistic = False
-                
-                # 3. АБСОЛЮТНА перевірка цін для топ-монет (як ETH $3701 vs $4601)  
-                if clean_symbol in major_tokens:
-                    # Перевіряємо що цінди в розумних межах для топ-монет
-                    expected_ranges = {
-                        'ETH': (2000, 6000),    # ETH очікується $2000-6000
-                        'BTC': (30000, 100000), # BTC очікується $30k-100k  
-                        'BNB': (200, 1000),     # BNB очікується $200-1000
-                        'SOL': (50, 500),       # SOL очікується $50-500
-                        'ADA': (0.2, 3.0),      # ADA очікується $0.2-3.0
-                    }
-                    
-                    if clean_symbol in expected_ranges:
-                        min_price, max_price = expected_ranges[clean_symbol]
-                        if not (min_price <= xt_price <= max_price) or not (min_price <= dex_price <= max_price):
-                            logging.warning(f"[{symbol}] ❌ ФЕЙК: Ціна поза межами для {clean_symbol}: XT=${xt_price:.2f}, Dex=${dex_price:.2f} (очікується ${min_price}-${max_price})")
-                            is_realistic = False
-                
-                # 4. ЖОРСТКІ ФІЛЬТРИ: Мінімальна ліквідність та обсяг для торгівлі (як просив користувач)
-                min_liquidity = token_info.get('liquidity', 0)
-                min_volume_24h = token_info.get('volume_24h', 0)
-                
-                if min_liquidity < MIN_POOLED_LIQUIDITY_USD:  # ФІЛЬТР з config.py
-                    logging.warning(f"[{symbol}] ❌ ФЕЙК: Мала ліквідність ${min_liquidity:,.0f} < ${MIN_POOLED_LIQUIDITY_USD:,}")
-                    is_realistic = False
-                    
-                if min_volume_24h < MIN_24H_VOLUME_USD:  # ФІЛЬТР з config.py
-                    logging.warning(f"[{symbol}] ❌ ФЕЙК: Малий обсяг ${min_volume_24h:,.0f} < ${MIN_24H_VOLUME_USD:,}")
-                    is_realistic = False
-                
-                # 5. Перевіряємо що це не стейблкоїн або заблоковані токени
-                blacklisted_tokens = ['USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'FDUSD', 'TON']
-                if any(token in clean_symbol for token in blacklisted_tokens):
-                    logging.info(f"[{symbol}] ❌ ЗАБЛОКОВАНО: Токен {clean_symbol} в чорному списку")
-                    is_realistic = False
-                
-                # 6. ДОДАТКОВО: Перевірка кратності цін (виявляє деякі фейки)
-                if xt_price > 0 and dex_price > 0:
-                    # Якщо одна ціна є точним кратним іншої (x10, x100), це може бути помилка
-                    ratio_check = xt_price / dex_price
-                    if abs(ratio_check - round(ratio_check)) < 0.01 and round(ratio_check) >= 10:
-                        logging.warning(f"[{symbol}] ❌ ФЕЙК: Підозрюване кратне співвідношення цін {ratio_check:.1f}x")
-                        is_realistic = False
-                
-                # АВТОСИГНАЛИ: Окремі сигнали для кожної пари бірж >= MIN_SPREAD
-                
-                # Логування нових фішок
-                if volatility.get('status') == 'success':
-                    # Компактний звіт якості (зменшено логування)
-                    if volatility.get('status') == 'success' and volume_analysis.get('status') == 'success':
-                        logging.info(f"[{symbol}] 📊 Vol: {volatility['volatility']}% | Об'єм: ${volume_analysis['total_volume']:,.0f} | Тайминг: {smart_timing.get('grade', 'N/A')}")
-                
-                # Підвищуємо вимоги до входу на основі нових фішок
-                enhanced_entry_check = True
-                
-                # 🎯 ДОЗВОЛЕНО: Блокування тільки найгірших сигналів (дозволяємо FAIR тайминг)
-                timing_recommendation = smart_timing.get('recommendation', 'WAIT')
-                if timing_recommendation in ['SKIP_SIGNAL']:  # Тільки SKIP_SIGNAL, WAIT/CONSIDER дозволені
-                    logging.warning(f"[{symbol}] ❌ БЛОКОВАНИЙ СИГНАЛ: таймінг {smart_timing.get('grade')} ({smart_timing.get('timing_score', 0)} балів)")
-                    enhanced_entry_check = False  # БЛОКУЄМО тільки найгірші сигнали
-                
-                # Блокуємо при екстремальній волатильності
-                if volatility.get('risk_level') == 'EXTREME':
-                    logging.info(f"[{symbol}] 📊 ІНФО: Висока волатільність {volatility.get('volatility', 0)}% але торгуємо далі")
-                    # БЕЗ БЛОКУВАННЯ enhanced_entry_check залишається True
-                
-                # Блокуємо при низькому об'ємі
-                if volume_analysis.get('quality_score', 0) <= 1:
-                    logging.warning(f"[{symbol}] 📈 БЛОКОВАНО: Занадто низький об'єм ${volume_analysis.get('total_volume', 0):,.0f}")
-                    enhanced_entry_check = False
-                
-                # 🛡️ ПЕРЕВІРЯЄМО ІСНУЮЧІ ПОЗИЦІЇ ПЕРЕД ВІДПРАВКОЮ СИГНАЛІВ
-                with active_positions_lock:
-                    already_has_position = symbol in active_positions
+                        current_positions = len(active_positions)
 
-                # 🎯 НОВА ЛОГІКА: ЗБИРАЄМО МОЖЛИВОСТІ БЕЗ БАЛАНСОВИХ ОБМЕЖЕНЬ ДЛЯ НАЙКРАЩИХ СИГНАЛІВ
-                logging.info(f"🔍 ПЕРЕВІРКА СИГНАЛУ {symbol}: realistic={is_realistic}, entry_check={enhanced_entry_check}, has_position={already_has_position}")
-                if is_realistic and enhanced_entry_check and not already_has_position:
-                    # 1. XT vs DexScreener (ТІЛЬКИ XT БІРЖА)
+                    if current_positions >= MAX_OPEN_POSITIONS:
+                        logging.warning(f"[{symbol}] 🚫 Досягнуто максимум відкритих позицій ({current_positions}/{MAX_OPEN_POSITIONS}) — пропускаємо сигнал")
+                        return  # або continue, якщо всередині циклу
+                    
+                    current_time = time.time()
+                    logging.info(f"🔥 СИГНАЛ ЗНАЙДЕНО: {symbol} спред={xt_dex_spread_pct:.2f}% (мін={MIN_SPREAD}%, макс={MAX_SPREAD}%)")
+                    
+                    # 🎯 ЗБИРАЄМО ДЛЯ НАЙКРАЩИХ СИГНАЛІВ (БЕЗ КУЛДАУН ПЕРЕВІРКИ ТУТ)
+                    side = "LONG" if xt_dex_spread_pct > 0 else "SHORT"
+                    
+                    # Розраховуємо рейтинг можливості для пошуку найкращого
+                    liquidity = advanced_metrics.get('liquidity', 0)
+                    volume_24h = advanced_metrics.get('volume_24h', 0) 
+                    score = abs(xt_dex_spread_pct) * 100 + (liquidity / 1000) + (volume_24h / 10000)
+                    
+                    # ✅ ДОДАЄМО В СИСТЕМУ НАЙКРАЩИХ МОЖЛИВОСТЕЙ (БЕЗ БАЛАНСОВИХ ОБМЕЖЕНЬ)
+                    with opportunities_lock:
+                        best_opportunities[symbol] = {
+                            'spread': xt_dex_spread_pct,
+                            'side': side,
+                            'score': score,
+                            'timestamp': current_time,
+                            'xt_price': xt_price,
+                            'dex_price': dex_price,
+                            'token_info': token_info,
+                            'advanced_metrics': advanced_metrics
+                        }
+                    
+                    logging.info(f"[{symbol}] 🏆 ДОДАНО ДО НАЙКРАЩИХ: {side} спред={xt_dex_spread_pct:.2f}% (рейтинг={score:.1f})")
+                    
+                    # 🚨 НОВА ЛОГІКА: НЕГАЙНЕ ВІДПРАВЛЕННЯ СИГНАЛУ НЕЗАЛЕЖНО ВІД БАЛАНСУ!
+                    # Відправляємо сигнал одразу після знаходження можливості (тільки з кулдауном)
+                    signal_sent = False
+                    
+                    with telegram_cooldown_lock:  # КРИТИЧНА СЕКЦІЯ
+                        last_signal_time = telegram_cooldown.get(symbol, 0)
+                        time_since_last = current_time - last_signal_time
+                        
+                        if time_since_last >= TELEGRAM_COOLDOWN_SEC:
+                            signal_sent = True
+                            
+                            # 🛡️ ВЕРИФІКАЦІЯ СИГНАЛУ (як просить користувач - блокуємо без DEX адреси!)
+                            logging.info(f"🔍 ВЕРИФІКУЮ СИГНАЛ: {symbol} {side} спред={xt_dex_spread_pct:.2f}%")
+                            
+                            try:
+                                # Створюємо ArbitrageSignal об'єкт для верифікації
+                                from signal_parser import ArbitrageSignal
+                                from signal_verification import verify_arbitrage_signal
+                                from telegram_formatter import format_arbitrage_signal_message
+                                
+                                test_signal = ArbitrageSignal(
+                                    asset=clean_symbol,
+                                    action=side,
+                                    spread_percent=xt_dex_spread_pct,
+                                    xt_price=xt_price,
+                                    dex_price=dex_price
+                                )
+                                
+                                # КРИТИЧНО: Повна верифікація з блокуванням сигналів без DEX адреси
+                                verification_result = verify_arbitrage_signal(test_signal)
+                                
+                                if verification_result.valid:
+                                    # ✅ СИГНАЛ ВАЛІДНИЙ - відправляємо з повною інформацією
+                                    signal_message = format_arbitrage_signal_message(test_signal, verification_result)
+                                    logging.info(f"✅ СИГНАЛ ВЕРИФІКОВАНО для {symbol}: DEX знайдено!")
+                                else:
+                                    # 🔄 СИГНАЛ НЕ ВЕРИФІКОВАНО - відправляємо з fallback посиланням
+                                    logging.info(f"⚠️ ВІДПРАВЛЯЄМО FALLBACK СИГНАЛ для {symbol}: {'; '.join(verification_result.errors)}")
+                                    signal_message = format_arbitrage_signal_message(test_signal, verification_result, for_group=True)
+                                    # НЕ блокуємо відправку - відправляємо з fallback посиланнями!
+                                
+                            except Exception as signal_error:
+                                logging.error(f"❌ Помилка верифікації сигналу {symbol}: {signal_error}")
+                                signal_sent = False
+                                signal_message = None
+                    
+                    # 📱 ВІДПРАВЛЕННЯ В TELEGRAM (ПОЗА ЛОКОМ) - ТІЛЬКИ ВАЛІДНІ СИГНАЛИ!
+                    signal_message = locals().get('signal_message', None)
+                    if signal_sent and signal_message:
+                        try:
+                            # 🎯 ТОРГОВІ СИГНАЛИ ОБОМ АДМІНАМ + ГРУПІ
+                            success2 = send_to_admins_and_group(signal_message)
+                            
+                            if success2:
+                                # ТІЛЬКИ ПІСЛЯ УСПІШНОЇ ВІДПРАВКИ встановлюємо кулдаун
+                                with telegram_cooldown_lock:
+                                    telegram_cooldown[symbol] = current_time
+                                logging.info(f"📱 СИГНАЛ ВІДПРАВЛЕНО: {symbol} {side} спред={xt_dex_spread_pct:.2f}% (ігноруємо баланс)")
+                            else:
+                                logging.error(f"❌ Помилка відправки в обидва чати {symbol}")
+                                
+                        except Exception as telegram_error:
+                            logging.error(f"❌ Помилка Telegram відправки {symbol}: {telegram_error}")
+                    
+                    # Показуємо кулдаун якщо сигнал заблокований
+                    if not signal_sent:
+                        with telegram_cooldown_lock:
+                            last_signal_time = telegram_cooldown.get(symbol, 0)
+                            time_since_last = current_time - last_signal_time
+                            if time_since_last < TELEGRAM_COOLDOWN_SEC:
+                                time_left = int(TELEGRAM_COOLDOWN_SEC - time_since_last)
+                                logging.info(f"[{symbol}] ⏰ КУЛДАУН: ще {time_left}с до наступного сигналу")
+                    
+                    # 🔄 СТАРА ЛОГІКА: Тільки для безпосереднього торгування (з балансовими обмеженнями)
+                    # ПРИМУСОВА МАРЖА $5: купуємо частково для будь-якої монети  
+                    # Завжди торгуємо на ФІКСОВАНУ маржу $5.00 (можна купити частину монети)
+                    
+                    time.sleep(5) # ⬅️ ЗМІНЕНО: Це було у вас в коді, я залишив. Можливо, це для rate-limit? Якщо ні, можна прибрати.
+                
+                # 2. XT vs DexScreener (якщо XT доступна)
+                if xt_price:
                     xt_dex_spread_pct = calculate_spread(dex_price, xt_price)
-                    if abs(xt_dex_spread_pct) >= MIN_SPREAD:
+                    if MIN_SPREAD <= abs(xt_dex_spread_pct) <= MAX_SPREAD:
+                        # ПРИМУСОВА МАРЖА $5: купуємо частково для будь-якої монети
+                        # Завжди торгуємо на ФІКСОВАНУ маржу $5.00 (можна купити частину монети)
+                        # 🕒 THREAD-SAFE КУЛДАУН: синхронізація для багатопоточності
                         current_time = time.time()
-                        logging.info(f"🔥 СИГНАЛ ЗНАЙДЕНО: {symbol} спред={xt_dex_spread_pct:.2f}% (мін={MIN_SPREAD}%, макс={MAX_SPREAD}%)")
-                        
-                        # 🎯 ЗБИРАЄМО ДЛЯ НАЙКРАЩИХ СИГНАЛІВ (БЕЗ КУЛДАУН ПЕРЕВІРКИ ТУТ)
-                        side = "LONG" if xt_dex_spread_pct > 0 else "SHORT"
-                        
-                        # Розраховуємо рейтинг можливості для пошуку найкращого
-                        liquidity = advanced_metrics.get('liquidity', 0)
-                        volume_24h = advanced_metrics.get('volume_24h', 0) 
-                        score = abs(xt_dex_spread_pct) * 100 + (liquidity / 1000) + (volume_24h / 10000)
-                        
-                        # ✅ ДОДАЄМО В СИСТЕМУ НАЙКРАЩИХ МОЖЛИВОСТЕЙ (БЕЗ БАЛАНСОВИХ ОБМЕЖЕНЬ)
-                        with opportunities_lock:
-                            best_opportunities[symbol] = {
-                                'spread': xt_dex_spread_pct,
-                                'side': side,
-                                'score': score,
-                                'timestamp': current_time,
-                                'xt_price': xt_price,
-                                'dex_price': dex_price,
-                                'token_info': token_info,
-                                'advanced_metrics': advanced_metrics
-                            }
-                        
-                        logging.info(f"[{symbol}] 🏆 ДОДАНО ДО НАЙКРАЩИХ: {side} спред={xt_dex_spread_pct:.2f}% (рейтинг={score:.1f})")
-                        
-                        # 🚨 НОВА ЛОГІКА: НЕГАЙНЕ ВІДПРАВЛЕННЯ СИГНАЛУ НЕЗАЛЕЖНО ВІД БАЛАНСУ!
-                        # Відправляємо сигнал одразу після знаходження можливості (тільки з кулдауном)
                         signal_sent = False
                         
-                        with telegram_cooldown_lock:  # КРИТИЧНА СЕКЦІЯ
+                        with telegram_cooldown_lock:  # КРИТИЧНА СЕКЦІЯ  
                             last_signal_time = telegram_cooldown.get(symbol, 0)
                             time_since_last = current_time - last_signal_time
                             
                             if time_since_last >= TELEGRAM_COOLDOWN_SEC:
+                                telegram_cooldown[symbol] = current_time  # Одразу встановлюємо час
                                 signal_sent = True
-                                
-                                # 🛡️ ВЕРИФІКАЦІЯ СИГНАЛУ (як просить користувач - блокуємо без DEX адреси!)
-                                logging.info(f"🔍 ВЕРИФІКУЮ СИГНАЛ: {symbol} {side} спред={xt_dex_spread_pct:.2f}%")
-                                
-                                try:
-                                    # Створюємо ArbitrageSignal об'єкт для верифікації
-                                    from signal_parser import ArbitrageSignal
-                                    from signal_verification import verify_arbitrage_signal
-                                    from telegram_formatter import format_arbitrage_signal_message
-                                    
-                                    test_signal = ArbitrageSignal(
-                                        asset=clean_symbol,
-                                        action=side,
-                                        spread_percent=xt_dex_spread_pct,
-                                        xt_price=xt_price,
-                                        dex_price=dex_price
-                                    )
-                                    
-                                    # КРИТИЧНО: Повна верифікація з блокуванням сигналів без DEX адреси
-                                    verification_result = verify_arbitrage_signal(test_signal)
-                                    
-                                    if verification_result.valid:
-                                        # ✅ СИГНАЛ ВАЛІДНИЙ - відправляємо з повною інформацією
-                                        signal_message = format_arbitrage_signal_message(test_signal, verification_result)
-                                        logging.info(f"✅ СИГНАЛ ВЕРИФІКОВАНО для {symbol}: DEX знайдено!")
-                                    else:
-                                        # 🔄 СИГНАЛ НЕ ВЕРИФІКОВАНО - відправляємо з fallback посиланням
-                                        logging.info(f"⚠️ ВІДПРАВЛЯЄМО FALLBACK СИГНАЛ для {symbol}: {'; '.join(verification_result.errors)}")
-                                        signal_message = format_arbitrage_signal_message(test_signal, verification_result, for_group=True)
-                                        # НЕ блокуємо відправку - відправляємо з fallback посиланнями!
-                                    
-                                except Exception as signal_error:
-                                    logging.error(f"❌ Помилка верифікації сигналу {symbol}: {signal_error}")
-                                    signal_sent = False
-                                    signal_message = None
-                        
-                        # 📱 ВІДПРАВЛЕННЯ В TELEGRAM (ПОЗА ЛОКОМ) - ТІЛЬКИ ВАЛІДНІ СИГНАЛИ!
-                        signal_message = locals().get('signal_message', None)
-                        if signal_sent and signal_message:
-                            try:
-                                # 🎯 ТОРГОВІ СИГНАЛИ ОБОМ АДМІНАМ + ГРУПІ
-                                success2 = send_to_admins_and_group(signal_message)
-                                
-                                if success2:
-                                    # ТІЛЬКИ ПІСЛЯ УСПІШНОЇ ВІДПРАВКИ встановлюємо кулдаун
-                                    with telegram_cooldown_lock:
-                                        telegram_cooldown[symbol] = current_time
-                                    logging.info(f"📱 СИГНАЛ ВІДПРАВЛЕНО: {symbol} {side} спред={xt_dex_spread_pct:.2f}% (ігноруємо баланс)")
-                                else:
-                                    logging.error(f"❌ Помилка відправки в обидва чати {symbol}")
-                                    
-                            except Exception as telegram_error:
-                                logging.error(f"❌ Помилка Telegram відправки {symbol}: {telegram_error}")
-                        
-                        # Показуємо кулдаун якщо сигнал заблокований
-                        if not signal_sent:
-                            with telegram_cooldown_lock:
-                                last_signal_time = telegram_cooldown.get(symbol, 0)
-                                time_since_last = current_time - last_signal_time
-                                if time_since_last < TELEGRAM_COOLDOWN_SEC:
-                                    time_left = int(TELEGRAM_COOLDOWN_SEC - time_since_last)
-                                    logging.info(f"[{symbol}] ⏰ КУЛДАУН: ще {time_left}с до наступного сигналу")
-                        
-                        # 🔄 СТАРА ЛОГІКА: Тільки для безпосереднього торгування (з балансовими обмеженнями)
-                        # ПРИМУСОВА МАРЖА $5: купуємо частково для будь-якої монети  
-                        # Завжди торгуємо на ФІКСОВАНУ маржу $5.00 (можна купити частину монети)
-                        
-                        time.sleep(5)
-                    
-                    # 2. XT vs DexScreener (якщо XT доступна)
-                    if xt_price:
-                        xt_dex_spread_pct = calculate_spread(dex_price, xt_price)
-                        if abs(xt_dex_spread_pct) >= MIN_SPREAD:
-                            # ПРИМУСОВА МАРЖА $5: купуємо частково для будь-якої монети
-                            # Завжди торгуємо на ФІКСОВАНУ маржу $5.00 (можна купити частину монети)
-                            # 🕒 THREAD-SAFE КУЛДАУН: синхронізація для багатопоточності
-                            current_time = time.time()
-                            signal_sent = False
-                            
-                            with telegram_cooldown_lock:  # КРИТИЧНА СЕКЦІЯ  
-                                last_signal_time = telegram_cooldown.get(symbol, 0)
-                                time_since_last = current_time - last_signal_time
-                                
-                                if time_since_last >= TELEGRAM_COOLDOWN_SEC:
-                                    telegram_cooldown[symbol] = current_time  # Одразу встановлюємо час
-                                    signal_sent = True
-                                else:
-                                    time_left = int(TELEGRAM_COOLDOWN_SEC - time_since_last)
-                                    logging.info(f"[{symbol}] ⏰ СПІЛЬНИЙ КУЛДАУН: ще {time_left}с до наступного сигналу")
-                            
-                            # 🎯 ВИДАЛЕНО ДУБЛІКАТ: цей блок дублював логіку з рядків вище
-                            # Залишаємо тільки систему найкращих сигналів
-                        
-                        # ВИДАЛЕНО: міжбіржовий арбітраж Gate ↔ XT (залишаємо тільки DEX порівняння)
-                elif already_has_position:
-                    logging.info(f"[{symbol}] ⏹️ ПРОПУСКАЄМО СИГНАЛ: вже є активна позиція")
-                elif abs(spread_pct) >= MIN_SPREAD and not is_realistic:
-                    logging.warning(f"[{symbol}] ❌ БЛОКОВАНИЙ ФЕЙК: спред={spread_pct:.2f}%")
-                
-                # РЕАЛЬНА ТОРГІВЛЯ З УСЕРЕДНЕННЯМ
-                if spread_check and balance_check and not DRY_RUN and is_realistic:
-                    side = "LONG" if spread_pct > 0 else "SHORT"
-                    
-                    # Логіка базового входу або усереднення
-                    if not has_position and positions_check:
-                        # БАЗОВИЙ ВХІД: Відкриваємо нову позицію
-                        logging.info(f"[{symbol}] 🎯 БАЗОВИЙ ВХІД: spread={abs(spread_pct):.3f}% >= {MIN_SPREAD}%, баланс={available_balance:.4f} >= {required_margin:.4f}, позицій={total_positions} < {MAX_OPEN_POSITIONS}")
-
-                        # СТРОГА перевірка order book ліквідності з правильної біржі
-                        ok_liq = can_execute_on_orderbook(symbol, ORDER_AMOUNT, ORDER_BOOK_DEPTH, exchange=trading_exchange)
-                        
-                        # 🔍 ДОДАТКОВА ПЕРЕВІРКА XT order book ліквідності (спеціальна для XT.com)
-                        if ok_liq and trading_exchange == "xt":
-                            # ВИПРАВЛЕНО: використовуємо notional size (маржа * леверидж) замість тільки маржі
-                            notional_size = ORDER_AMOUNT * LEVERAGE
-                            current_side = "LONG" if spread_pct > 0 else "SHORT"  # Явно визначаємо side
-                            can_trade_xt, xt_liquidity_info = analyze_xt_order_book_liquidity(xt, symbol, current_side, notional_size, min_liquidity_ratio=2.0)
-                            if not can_trade_xt:
-                                logging.warning(f"[{symbol}] {xt_liquidity_info}")
-                                ok_liq = False
                             else:
-                                logging.info(f"[{symbol}] {xt_liquidity_info}")
+                                time_left = int(TELEGRAM_COOLDOWN_SEC - time_since_last)
+                                logging.info(f"[{symbol}] ⏰ СПІЛЬНИЙ КУЛДАУН: ще {time_left}с до наступного сигналу")
                         
-                        if ok_liq:
-                            # ПРИМУСОВЕ встановлення левериджу ПЕРЕД кожною угодою
-                            if trading_exchange == "xt":
-                                try:
-                                    # Правильний виклик з positionSide
-                                    position_side = "LONG" if side == "LONG" else "SHORT"
-                                    xt.set_leverage(LEVERAGE, symbol, {"positionSide": position_side})
-                                    logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x ({position_side})")
-                                except Exception as e:
-                                    logging.error(f"[{symbol}] ❌ Помилка встановлення левериджу XT: {e}")
-                                    # Не блокуємо торгівлю, продовжуємо
-                                    pass
-                                    
-                                # 🔒 ORDER PLACEMENT LOCK (Task 6: запобігаємо подвійним ордерам)
-                                with order_placement_lock:
-                                    # 🎯 ПАРАЛЕЛЬНА ТОРГІВЛЯ НА ДВОХ АКАУНТАХ
-                                    order_account_1 = xt_open_market_position(xt_account_1, symbol, side, ORDER_AMOUNT, LEVERAGE, ref_price, dex_price, spread_pct)
-                                    order_account_2 = xt_open_market_position(xt_account_2, symbol, side, ORDER_AMOUNT, LEVERAGE, ref_price, dex_price, spread_pct)
-                                    # Вважаємо успішним якщо хоча б один акаунт відкрив позицію
-                                    order = order_account_1 or order_account_2
-                                    if order_account_1:
-                                        logging.info(f"[{symbol}] ✅ АКАУНТ 1: Відкрито {side} позицію з левериджем {LEVERAGE}x")
-                                    if order_account_2:
-                                        logging.info(f"[{symbol}] ✅ АКАУНТ 2: Відкрито {side} позицію з левериджем {LEVERAGE}x")
-                            else:
-                                order = None
-                            if order:
-                                    logging.info(f"[{symbol}] 🚀 XT: Відкрито {side} позиції на обох акаунтах з левериджем {LEVERAGE}x")
-                            # ❌ GATE.IO ВІДКЛЮЧЕНО - тільки XT біржа!
-                            # else:  # gate (ВІДКЛЮЧЕНО)
-                            #     order = open_market_position(symbol, side, ORDER_AMOUNT, LEVERAGE, gate_price, dex_price, spread_pct)
-                            if order:
-                                # Створюємо агреговану позицію
-                                entry_price = ref_price  # Завжди XT ціна
-                                # ФІКСОВАНА ЦІЛЬ: +30% прибутку з левериджем (як просив користувач)
-                                if side == "LONG":
-                                    tp_price = entry_price * (1 + 0.30 / LEVERAGE)  # 30% прибутку з левериджем
-                                else:  # SHORT
-                                    tp_price = entry_price * (1 - 0.30 / LEVERAGE)  # 30% прибутку з левериджем
-                                position = {
-                                    "side": side,
-                                    "avg_entry": entry_price,
-                                    "size_usdt": ORDER_AMOUNT,
-                                    "adds_done": 0,
-                                    "last_add_price": entry_price,
-                                    "tp_price": tp_price,
-                                    "last_add_time": time.time(),
-                                    "exchange": trading_exchange,  # Запам'ятовуємо на якій біржі торгуємо
-                                    # 🎯 НОВІ ПОЛЯ ДЛЯ АВТОМАТИЧНОГО ЗАКРИТТЯ
-                                    "entry_time": time.time(),  # час входу в позицію
-                                    "arb_pair": f"{trading_exchange}-dex",  # тип арбітражу (gate-dex або xt-dex)
-                                    "entry_spread_pct": spread_pct,  # початковий спред
-                                    "entry_ref_price": dex_price,  # референтна ціна DEX на час входу
-                                    "status": "open"  # статус позиції (open/closing/closed)
-                                }
-                                # 🔒 ЗАХИСТ: Тільки для НОВИХ позицій встановлюємо таймери
-                                current_time = time.time()
-                                existing_position = active_positions.get(symbol, {})
-                                if 'opened_at' not in existing_position or existing_position.get('opened_at', 0) <= 0:
-                                    position['opened_at'] = current_time
-                                else:
-                                    position['opened_at'] = existing_position['opened_at']  # Зберігаємо існуючий!
-                                if 'expires_at' not in existing_position or existing_position.get('expires_at', 0) <= 0:
-                                    position['expires_at'] = position['opened_at'] + POSITION_MAX_AGE_SEC
-                                else:
-                                    position['expires_at'] = existing_position['expires_at']  # Зберігаємо існуючий!
-                                position['xt_pair_url'] = generate_xt_pair_url(symbol)
-                                
-                                with active_positions_lock:
-                                    active_positions[symbol] = position
-                                
-                                # Зберігаємо оновлені позиції
-                                save_positions_to_file()
-                                
-                                # 📱 ВІДПРАВЛЯЄМО ПРОФЕСІЙНЕ ПОВІДОМЛЕННЯ ПРО ВІДКРИТТЯ ПОЗИЦІЇ
-                                try:
-                                    from telegram_formatter import format_position_opened_message
-                                    opened_message = format_position_opened_message(
-                                        symbol=symbol,
-                                        side=side,
-                                        entry_price=ref_price,
-                                        size_usd=ORDER_AMOUNT,
-                                        leverage=LEVERAGE,
-                                        spread_percent=spread_pct
-                                    )
-                                    send_to_admins_and_group(opened_message)
-                                    logging.info(f"📱 Відправлено Telegram про відкриття {symbol}")
-                                except Exception as e:
-                                    logging.error(f"❌ Помилка відправки Telegram: {e}")
-                                
-                                logging.info("Opened %s on %s avg_entry=%.6f tp=%.6f", side, symbol, ref_price, tp_price)
+                        # 🎯 ВИДАЛЕНО ДУБЛІКАТ: цей блок дублював логіку з рядків вище
+                        # Залишаємо тільки систему найкращих сигналів
                     
-                    elif has_position and AVERAGING_ENABLED:
-                        # 🔒 УСЕРЕДНЕННЯ: Отримуємо позицію з захистом
-                        with active_positions_lock:
-                            position = active_positions[symbol].copy()  # Копіюємо для уникнення змін під час роботи
-                        current_time = time.time()
-                        cooldown_passed = (current_time - position.get('last_add_time', 0)) >= AVERAGING_COOLDOWN_SEC
-                        can_add_more = position.get('adds_done', 0) < AVERAGING_MAX_ADDS
-                        
-                        # 🔍 ДЕТАЛЬНЕ ЛОГУВАННЯ для діагностики
-                        logging.info(f"[{symbol}] 🔍 УСЕРЕДНЕННЯ ДІАГНОСТИКА: adds_done={position.get('adds_done', 0)}, max_adds={AVERAGING_MAX_ADDS}, can_add_more={can_add_more}, cooldown_passed={cooldown_passed}")
-                        
-                        # Перевірка ліміту позиції на символ
-                        position_size_ok = position['size_usdt'] < MAX_POSITION_USDT_PER_SYMBOL
-                        
-                        # 🎯 ЯВНА ПЕРЕВІРКА ВСІХ УМОВ для усереднення (як просив architect)
-                        if AVERAGING_ENABLED and can_add_more and cooldown_passed and position_size_ok:
-                            # Перевірка чи ціна йде проти позиції
-                            avg_entry = position['avg_entry']
-                            should_average = False
-                            
-                            if position['side'] == "LONG" and side == "LONG":
-                                # LONG позиція: усереднюємо якщо ціна впала
-                                adverse_threshold = avg_entry * (1 - AVERAGING_THRESHOLD_PCT / 100)
-                                should_average = xt_price <= adverse_threshold
-                            elif position['side'] == "SHORT" and side == "SHORT":
-                                # SHORT позиція: усереднюємо якщо ціна виросла
-                                adverse_threshold = avg_entry * (1 + AVERAGING_THRESHOLD_PCT / 100)
-                                should_average = xt_price >= adverse_threshold
-                            
-                            if should_average:
-                                # 🎯 ЖОРСТКА ПЕРЕВІРКА ЛІМІТІВ: не перевищуємо MAX_POSITION_USDT_PER_SYMBOL
-                                remaining_capacity = MAX_POSITION_USDT_PER_SYMBOL - position['size_usdt']
-                                
-                                if remaining_capacity <= 0:
-                                    logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ ЗАБЛОКОВАНО: позиція досягла максимуму ${MAX_POSITION_USDT_PER_SYMBOL:.2f}, поточний розмір=${position['size_usdt']:.2f}")
-                                    continue  # Пропускаємо усереднення
-                                
-                                # 🛡️ ТОЧНИЙ РОЗРАХУНОК: використовуємо фіксований ORDER_AMOUNT, але перевіряємо ліміти
-                                if remaining_capacity < ORDER_AMOUNT:
-                                    logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ СКАСОВАНО: недостатньо місця для ORDER_AMOUNT=${ORDER_AMOUNT:.2f}, залишок=${remaining_capacity:.2f}")
-                                    continue
-                                if available_balance < ORDER_AMOUNT:
-                                    logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ СКАСОВАНО: недостатньо балансу для ORDER_AMOUNT=${ORDER_AMOUNT:.2f}, баланс=${available_balance:.2f}")
-                                    continue
-                                
-                                # 🎯 ЗАВЖДИ ВИКОРИСТОВУЄМО ФІКСОВАНИЙ ORDER_AMOUNT для консистентності
-                                add_size = ORDER_AMOUNT
-                                
-                                logging.info(f"[{symbol}] 📈 УСЕРЕДНЕННЯ РОЗРАХУНОК: поточний_розмір=${position['size_usdt']:.2f}, макс=${MAX_POSITION_USDT_PER_SYMBOL:.2f}, залишок=${remaining_capacity:.2f}, додаємо=${add_size:.2f}")
-                                
-                                # УСЕРЕДНЕННЯ ТІЛЬКИ ЯКЩО Є ДОСТАТНЬО МІСЦЯ ТА БАЛАНСУ!
-                                if add_size >= 1.0:  # Мінімум $1.00 для ордера
-                                    logging.info(f"[{symbol}] 📈 УСЕРЕДНЕННЯ: {position['side']} add_size=${add_size:.2f}, ціна={xt_price:.6f} vs avg={avg_entry:.6f}, спред={abs(spread_pct):.3f}%")
-                                    
-                                    # Перевірка ліквідності для усереднення з правильної біржі
-                                    ok_liq = can_execute_on_orderbook(symbol, add_size, ORDER_BOOK_DEPTH, exchange=trading_exchange)
-                                    
-                                    # 🔍 ДОДАТКОВА ПЕРЕВІРКА XT order book для усереднення
-                                    if ok_liq and trading_exchange == "xt":
-                                        # ВИПРАВЛЕНО: використовуємо notional size для усереднення
-                                        avg_notional_size = add_size * LEVERAGE
-                                        can_avg_xt, xt_avg_info = analyze_xt_order_book_liquidity(xt, symbol, position['side'], avg_notional_size, min_liquidity_ratio=2.0)
-                                        if not can_avg_xt:
-                                            logging.warning(f"[{symbol}] УСЕРЕДНЕННЯ: {xt_avg_info}")
-                                            ok_liq = False
-                                        else:
-                                            logging.info(f"[{symbol}] УСЕРЕДНЕННЯ: {xt_avg_info}")
-                                    
-                                    if ok_liq:
-                                        # ПРИМУСОВЕ встановлення левериджу ПЕРЕД усередненням
-                                        if trading_exchange == "xt":
-                                            try:
-                                                xt.set_leverage(LEVERAGE, symbol)
-                                                logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x для усереднення")
-                                            except Exception as e:
-                                                logging.error(f"[{symbol}] ❌ Помилка левериджу XT при усередненні: {e}")
-                                                pass
-                                                
-                                            # 🔒 ORDER PLACEMENT LOCK для усереднення (Task 6: запобігаємо конфліктним ордерам)
-                                            with order_placement_lock:
-                                                order = xt_open_market_position(xt, symbol, position['side'], add_size, LEVERAGE, ref_price, dex_price, spread_pct)
-                                            current_price = ref_price  # Завжди XT ціна
-                                        else:
-                                            order = None
-                                            current_price = ref_price
-                                        # ❌ GATE.IO ВІДКЛЮЧЕНО - тільки XT біржа!
-                                        # else:  # gate (ВІДКЛЮЧЕНО)
-                                        #     order = open_market_position(symbol, position['side'], add_size, LEVERAGE, gate_price, dex_price, spread_pct)
-                                        if order:
-                                            # 🔒 Оновлення агрегованої позиції з захистом
-                                            with active_positions_lock:
-                                                if symbol in active_positions:  # Перевіряємо що позиція ще існує
-                                                    current_position = active_positions[symbol]
-                                                    new_size = current_position['size_usdt'] + add_size
-                                                    new_avg_entry = (current_position['avg_entry'] * current_position['size_usdt'] + current_price * add_size) / new_size
-                                                else:
-                                                    logging.warning(f"[{symbol}] Позиція не знайдена для усереднення")
-                                                    continue
-                                                    # ФІКСОВАНА ЦІЛЬ: +30% прибутку з левериджем (як просив користувач)
-                                                    if current_position['side'] == "LONG":
-                                                        new_tp_price = new_avg_entry * (1 + 0.30 / LEVERAGE)  # 30% прибутку з левериджем
-                                                    else:  # SHORT
-                                                        new_tp_price = new_avg_entry * (1 - 0.30 / LEVERAGE)  # 30% прибутку з левериджем
-                                                    
-                                                    active_positions[symbol].update({
-                                                        'avg_entry': new_avg_entry,
-                                                        'size_usdt': new_size,
-                                                        'adds_done': current_position['adds_done'] + 1,
-                                                        'last_add_price': ref_price,
-                                                        'tp_price': new_tp_price,
-                                                        'last_add_time': current_time
-                                                    })
-                                                    
-                                                    # 🔍 ДЕТАЛЬНЕ ЛОГУВАННЯ оновлення позиції  
-                                                    logging.info(f"✅ ПОЗИЦІЯ ОНОВЛЕНА: adds_done {current_position['adds_done']} -> {current_position['adds_done'] + 1}, розмір ${current_position['size_usdt']:.2f} -> ${new_size:.2f}")
-                                            
-                                            # 🔍 ВИПРАВЛЕНО: використовуємо оновлене значення adds_done
-                                            updated_adds = current_position['adds_done'] + 1
-                                            logging.info(f"✅ УСЕРЕДНЕННЯ ЗАВЕРШЕНО {position['side']} на {symbol}: нова avg_entry={new_avg_entry:.6f}, розмір=${new_size:.2f}, додавань={updated_adds}/{AVERAGING_MAX_ADDS}")
-                else:
-                    if not spread_check:
-                        logging.debug(f"[{symbol}] Спред {abs(spread_pct):.3f}% < {MIN_SPREAD}%")
-                    elif not positions_check and not has_position:
-                        logging.info(f"[{symbol}] ❌ Занадто багато позицій: {total_positions} >= {MAX_OPEN_POSITIONS}")
-                    elif not balance_check:
-                        logging.info(f"[{symbol}] ❌ Недостатньо балансу: потрібно {required_margin:.4f} USDT, є {available_balance:.4f} USDT")
-            except Exception as balance_error:
-                logging.exception("Balance check error with full traceback")
-
-            # 4) 🔒 АВТОМАТИЧНЕ ЗАКРИТТЯ ПРИ СПРЕДІ 30% З ЗАХИСТОМ
-            with active_positions_lock:
-                if symbol in active_positions:
-                    position = active_positions[symbol].copy()  # Копіюємо для роботи поза локом
-                else:
-                    position = None
+                    # ВИДАЛЕНО: міжбіржовий арбітраж Gate ↔ XT (залишаємо тільки DEX порівняння)
+            elif already_has_position:
+                logging.info(f"[{symbol}] ⏹️ ПРОПУСКАЄМО СИГНАЛ: вже є активна позиція")
+            elif abs(spread_pct) >= MIN_SPREAD and not is_realistic:
+                logging.warning(f"[{symbol}] ❌ БЛОКОВАНИЙ ФЕЙК: спред={spread_pct:.2f}%")
             
-            if position:
+            # РЕАЛЬНА ТОРГІВЛЯ З УСЕРЕДНЕННЯМ
+            if spread_check and balance_check and not DRY_RUN and is_realistic:
+                side = "LONG" if spread_pct > 0 else "SHORT"
                 
-                # ✅ НОВІ УМОВИ ВИХОДУ (як просив користувач):
-                # 1) Основна ціль: +30% прибутку
-                # 2) При зникненні спреду: дострокове закриття на +10-15%
-                
-                current_price = ref_price  # Завжди XT ціна
-                entry_price = position['avg_entry']
-                
-                # Розрахунок поточного P&L у відсотках
-                if position['side'] == "LONG":
-                    pnl_pct = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
-                else:  # SHORT  
-                    pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
-                
-                should_close = False
-                close_reason = ""
-                
-                # 1) ОСНОВНА ЦІЛЬ: +30% прибутку (примусове закриття)
-                if pnl_pct >= 30.0:
-                    should_close = True
-                    close_reason = f"🎯 ДОСЯГНУТО ЦІЛЬ +30%! P&L={pnl_pct:.1f}%"
+                # Логіка базового входу або усереднення
+                if not has_position and positions_check:
+                    # БАЗОВИЙ ВХІД: Відкриваємо нову позицію
+                    logging.info(f"[{symbol}] 🎯 БАЗОВИЙ ВХІД: spread={abs(spread_pct):.3f}% >= {MIN_SPREAD}%, баланс={available_balance:.4f} >= {required_margin:.4f}, позицій={total_positions} < {MAX_OPEN_POSITIONS}")
+
+                    # СТРОГА перевірка order book ліквідності з правильної біржі
+                    ok_liq = can_execute_on_orderbook(symbol, ORDER_AMOUNT, ORDER_BOOK_DEPTH, exchange=trading_exchange)
                     
-                # 2) ДОСТРОКОВЕ ЗАКРИТТЯ: спред зникає + прибуток 10-15%
-                elif abs(spread_pct) < 0.3 and 10.0 <= pnl_pct < 30.0:  # спред < 0.3% вважається "зниклим"
-                    should_close = True
-                    close_reason = f"⚡ ДОСТРОКОВЕ ЗАКРИТТЯ: спред зник ({abs(spread_pct):.2f}% < 0.3%) + прибуток {pnl_pct:.1f}% (в межах 10-30%)"
-                    
-                # 3) ЗАХИСТ: спред > 30% (як було раніше)
-                elif abs(spread_pct) >= 30.0:
-                    should_close = True 
-                    close_reason = f"🚨 АВАРІЙНЕ ЗАКРИТТЯ: спред {abs(spread_pct):.2f}% >= 30%"
-                
-                if should_close:
-                    logging.warning(f"🚨 АВТОЗАКРИТТЯ {position['side']} {symbol}: {close_reason}")
-                    
-                    # БЕЗПЕЧНЕ ЗАКРИТТЯ: спочатку закриваємо на біржі, потім видаляємо з системи
-                    try:
-                        # Отримуємо свіжу ціну для точного закриття
-                        fresh_ticker = fetch_ticker(xt, symbol)
-                        if fresh_ticker:
-                            current_xt_price = float(fresh_ticker['last'])
+                    # 🔍 ДОДАТКОВА ПЕРЕВІРКА XT order book ліквідності (спеціальна для XT.com)
+                    if ok_liq and trading_exchange == "xt":
+                        # ВИПРАВЛЕНО: використовуємо notional size (маржа * леверидж) замість тільки маржі
+                        notional_size = ORDER_AMOUNT * LEVERAGE
+                        current_side = "LONG" if spread_pct > 0 else "SHORT"  # Явно визначаємо side
+                        can_trade_xt, xt_liquidity_info = analyze_xt_order_book_liquidity(xt, symbol, current_side, notional_size, min_liquidity_ratio=2.0)
+                        if not can_trade_xt:
+                            logging.warning(f"[{symbol}] {xt_liquidity_info}")
+                            ok_liq = False
                         else:
-                            current_xt_price = ref_price  # fallback
-                        
-                        # ПЕРЕВІРЯЄМО ЧИ ІСНУЄ ПОЗИЦІЯ ПЕРЕД ЗАКРИТТЯМ
-                        # Отримуємо свіжі позиції з біржі
-                        try:
-                            # 🔧 ВИКОРИСТОВУЄМО БЕЗПЕЧНИЙ WRAPPER
-                            # Gate.io відключено - використовуємо тільки XT  
-                            # Gate.io відключено - використовуємо тільки XT positions
-                            current_positions = []
-                            has_real_position = False
-                            for pos in current_positions:
-                                if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
-                                    has_real_position = True
-                                    break
+                            logging.info(f"[{symbol}] {xt_liquidity_info}")
+                    
+                    if ok_liq:
+                        # ПРИМУСОВЕ встановлення левериджу ПЕРЕД кожною угодою
+                        if trading_exchange == "xt":
+                            try:
+                                # Правильний виклик з positionSide
+                                position_side = "LONG" if side == "LONG" else "SHORT"
+                                xt.set_leverage(LEVERAGE, symbol, {"positionSide": position_side})
+                                logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x ({position_side})")
+                            except Exception as e:
+                                logging.error(f"[{symbol}] ❌ Помилка встановлення левериджу XT: {e}")
+                                # Не блокуємо торгівлю, продовжуємо
+                                pass
+                                
+                            # 🔒 ORDER PLACEMENT LOCK (Task 6: запобігаємо подвійним ордерам)
+                            with order_placement_lock:
+                                # 🎯 ПАРАЛЕЛЬНА ТОРГІВЛЯ НА ДВОХ АКАУНТАХ
+                                order_account_1 = xt_open_market_position(xt_account_1, symbol, side, ORDER_AMOUNT, LEVERAGE, ref_price, dex_price, spread_pct)
+                                order_account_2 = xt_open_market_position(xt_account_2, symbol, side, ORDER_AMOUNT, LEVERAGE, ref_price, dex_price, spread_pct)
+                                # Вважаємо успішним якщо хоча б один акаунт відкрив позицію
+                                order = order_account_1 or order_account_2
+                                if order_account_1:
+                                    logging.info(f"[{symbol}] ✅ АКАУНТ 1: Відкрито {side} позицію з левериджем {LEVERAGE}x")
+                                if order_account_2:
+                                    logging.info(f"[{symbol}] ✅ АКАУНТ 2: Відкрито {side} позицію з левериджем {LEVERAGE}x")
+                        else:
+                            order = None
+                        if order:
+                                logging.info(f"[{symbol}] 🚀 XT: Відкрито {side} позиції на обох акаунтах з левериджем {LEVERAGE}x")
+                        # ❌ GATE.IO ВІДКЛЮЧЕНО - тільки XT біржа!
+                        # else:  # gate (ВІДКЛЮЧЕНО)
+                        #     order = open_market_position(symbol, side, ORDER_AMOUNT, LEVERAGE, gate_price, dex_price, spread_pct)
+                        if order:
+                            # Створюємо агреговану позицію
+                            entry_price = ref_price  # Завжди XT ціна
+                            # ФІКСОВАНА ЦІЛЬ: +30% прибутку з левериджем (як просив користувач)
+                            if side == "LONG":
+                                tp_price = entry_price * (1 + 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+                            else:  # SHORT
+                                tp_price = entry_price * (1 - 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+                            position = {
+                                "side": side,
+                                "avg_entry": entry_price,
+                                "size_usdt": ORDER_AMOUNT,
+                                "adds_done": 0,
+                                "last_add_price": entry_price,
+                                "tp_price": tp_price,
+                                "last_add_time": time.time(),
+                                "exchange": trading_exchange,  # Запам'ятовуємо на якій біржі торгуємо
+                                # 🎯 НОВІ ПОЛЯ ДЛЯ АВТОМАТИЧНОГО ЗАКРИТТЯ
+                                "entry_time": time.time(),  # час входу в позицію
+                                "arb_pair": f"{trading_exchange}-dex",  # тип арбітражу (gate-dex або xt-dex)
+                                "entry_spread_pct": spread_pct,  # початковий спред
+                                "entry_ref_price": dex_price,  # референтна ціна DEX на час входу
+                                "status": "open"  # статус позиції (open/closing/closed)
+                            }
+                            # 🔒 ЗАХИСТ: Тільки для НОВИХ позицій встановлюємо таймери
+                            current_time = time.time()
+                            existing_position = active_positions.get(symbol, {})
+                            if 'opened_at' not in existing_position or existing_position.get('opened_at', 0) <= 0:
+                                position['opened_at'] = current_time
+                            else:
+                                position['opened_at'] = existing_position['opened_at']  # Зберігаємо існуючий!
+                            if 'expires_at' not in existing_position or existing_position.get('expires_at', 0) <= 0:
+                                position['expires_at'] = position['opened_at'] + POSITION_MAX_AGE_SEC
+                            else:
+                                position['expires_at'] = existing_position['expires_at']  # Зберігаємо існуючий!
+                            position['xt_pair_url'] = generate_xt_pair_url(symbol)
                             
-                            if not has_real_position:
-                                logging.warning(f"🚨 ПОЗИЦІЯ {symbol} УЖЕ ЗАКРИТА НА БІРЖІ - видаляємо з системи")
-                                with active_positions_lock:
-                                    if symbol in active_positions:
-                                        del active_positions[symbol]
-                                continue
-                        except:
-                            logging.warning(f"⚠️ Не вдалося перевірити позиції - пробуємо закрити")
+                            with active_positions_lock:
+                                active_positions[symbol] = position
+                            
+                            # Зберігаємо оновлені позиції
+                            save_positions_to_file()
+                            
+                            # 📱 ВІДПРАВЛЯЄМО ПРОФЕСІЙНЕ ПОВІДОМЛЕННЯ ПРО ВІДКРИТТЯ ПОЗИЦІЇ
+                            try:
+                                from telegram_formatter import format_position_opened_message
+                                opened_message = format_position_opened_message(
+                                    symbol=symbol,
+                                    side=side,
+                                    entry_price=ref_price,
+                                    size_usd=ORDER_AMOUNT,
+                                    leverage=LEVERAGE,
+                                    spread_percent=spread_pct
+                                )
+                                send_to_admins_and_group(opened_message)
+                                logging.info(f"📱 Відправлено Telegram про відкриття {symbol}")
+                            except Exception as e:
+                                logging.error(f"❌ Помилка відправки Telegram: {e}")
+                            
+                            logging.info("Opened %s on %s avg_entry=%.6f tp=%.6f", side, symbol, ref_price, tp_price)
+                
+                elif has_position and AVERAGING_ENABLED:
+                    # 🔒 УСЕРЕДНЕННЯ: Отримуємо позицію з захистом
+                    with active_positions_lock:
+                        position = active_positions[symbol].copy()  # Копіюємо для уникнення змін під час роботи
+                    current_time = time.time()
+                    cooldown_passed = (current_time - position.get('last_add_time', 0)) >= AVERAGING_COOLDOWN_SEC
+                    can_add_more = position.get('adds_done', 0) < AVERAGING_MAX_ADDS
+                    
+                    # 🔍 ДЕТАЛЬНЕ ЛОГУВАННЯ для діагностики
+                    logging.info(f"[{symbol}] 🔍 УСЕРЕДНЕННЯ ДІАГНОСТИКА: adds_done={position.get('adds_done', 0)}, max_adds={AVERAGING_MAX_ADDS}, can_add_more={can_add_more}, cooldown_passed={cooldown_passed}")
+                    
+                    # Перевірка ліміту позиції на символ
+                    position_size_ok = position['size_usdt'] < MAX_POSITION_USDT_PER_SYMBOL
+                    
+                    # 🎯 ЯВНА ПЕРЕВІРКА ВСІХ УМОВ для усереднення (як просив architect)
+                    if AVERAGING_ENABLED and can_add_more and cooldown_passed and position_size_ok:
+                        # Перевірка чи ціна йде проти позиції
+                        avg_entry = position['avg_entry']
+                        should_average = False
                         
-                        # Пробуємо закрити позицію на біржі
-                        close_success = close_position_market(symbol, position['side'], position['size_usdt'])
+                        if position['side'] == "LONG" and side == "LONG":
+                            # LONG позиція: усереднюємо якщо ціна впала
+                            adverse_threshold = avg_entry * (1 - AVERAGING_THRESHOLD_PCT / 100)
+                            should_average = xt_price <= adverse_threshold
+                        elif position['side'] == "SHORT" and side == "SHORT":
+                            # SHORT позиція: усереднюємо якщо ціна виросла
+                            adverse_threshold = avg_entry * (1 + AVERAGING_THRESHOLD_PCT / 100)
+                            should_average = xt_price >= adverse_threshold
                         
-                        if close_success:
-                            # 🔒 ТІЛЬКИ якщо закриття успішне - видаляємо з системи
+                        if should_average:
+                            # 🎯 ЖОРСТКА ПЕРЕВІРКА ЛІМІТІВ: не перевищуємо MAX_POSITION_USDT_PER_SYMBOL
+                            remaining_capacity = MAX_POSITION_USDT_PER_SYMBOL - position['size_usdt']
+                            
+                            if remaining_capacity <= 0:
+                                logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ ЗАБЛОКОВАНО: позиція досягла максимуму ${MAX_POSITION_USDT_PER_SYMBOL:.2f}, поточний розмір=${position['size_usdt']:.2f}")
+                                return # ⬅️ ЗМІНЕНО: з continue на return
+                            
+                            # 🛡️ ТОЧНИЙ РОЗРАХУНОК: використовуємо фіксований ORDER_AMOUNT, але перевіряємо ліміти
+                            if remaining_capacity < ORDER_AMOUNT:
+                                logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ СКАСОВАНО: недостатньо місця для ORDER_AMOUNT=${ORDER_AMOUNT:.2f}, залишок=${remaining_capacity:.2f}")
+                                return # ⬅️ ЗМІНЕНО: з continue на return
+                            if available_balance < ORDER_AMOUNT:
+                                logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ СКАСОВАНО: недостатньо балансу для ORDER_AMOUNT=${ORDER_AMOUNT:.2f}, баланс=${available_balance:.2f}")
+                                return # ⬅️ ЗМІНЕНО: з continue на return
+                            
+                            # 🎯 ЗАВЖДИ ВИКОРИСТОВУЄМО ФІКСОВАНИЙ ORDER_AMOUNT для консистентності
+                            add_size = ORDER_AMOUNT
+                            
+                            logging.info(f"[{symbol}] 📈 УСЕРЕДНЕННЯ РОЗРАХУНОК: поточний_розмір=${position['size_usdt']:.2f}, макс=${MAX_POSITION_USDT_PER_SYMBOL:.2f}, залишок=${remaining_capacity:.2f}, додаємо=${add_size:.2f}")
+                            
+                            # УСЕРЕДНЕННЯ ТІЛЬКИ ЯКЩО Є ДОСТАТНЬО МІСЦЯ ТА БАЛАНСУ!
+                            if add_size >= 1.0:  # Мінімум $1.00 для ордера
+                                logging.info(f"[{symbol}] 📈 УСЕРЕДНЕННЯ: {position['side']} add_size=${add_size:.2f}, ціна={xt_price:.6f} vs avg={avg_entry:.6f}, спред={abs(spread_pct):.3f}%")
+                                
+                                # Перевірка ліквідності для усереднення з правильної біржі
+                                ok_liq = can_execute_on_orderbook(symbol, add_size, ORDER_BOOK_DEPTH, exchange=trading_exchange)
+                                
+                                # 🔍 ДОДАТКОВА ПЕРЕВІРКА XT order book для усереднення
+                                if ok_liq and trading_exchange == "xt":
+                                    # ВИПРАВЛЕНО: використовуємо notional size для усереднення
+                                    avg_notional_size = add_size * LEVERAGE
+                                    can_avg_xt, xt_avg_info = analyze_xt_order_book_liquidity(xt, symbol, position['side'], avg_notional_size, min_liquidity_ratio=2.0)
+                                    if not can_avg_xt:
+                                        logging.warning(f"[{symbol}] УСЕРЕДНЕННЯ: {xt_avg_info}")
+                                        ok_liq = False
+                                    else:
+                                        logging.info(f"[{symbol}] УСЕРЕДНЕННЯ: {xt_avg_info}")
+                                
+                                if ok_liq:
+                                    # ПРИМУСОВЕ встановлення левериджу ПЕРЕД усередненням
+                                    if trading_exchange == "xt":
+                                        try:
+                                            xt.set_leverage(LEVERAGE, symbol)
+                                            logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x для усереднення")
+                                        except Exception as e:
+                                            logging.error(f"[{symbol}] ❌ Помилка левериджу XT при усередненні: {e}")
+                                            pass
+                                            
+                                        # 🔒 ORDER PLACEMENT LOCK для усереднення (Task 6: запобігаємо конфліктним ордерам)
+                                        with order_placement_lock:
+                                            order = xt_open_market_position(xt, symbol, position['side'], add_size, LEVERAGE, ref_price, dex_price, spread_pct)
+                                        current_price = ref_price  # Завжди XT ціна
+                                    else:
+                                        order = None
+                                        current_price = ref_price
+                                    if order:
+                                        # 🔒 Оновлення агрегованої позиції з захистом
+                                        with active_positions_lock:
+                                            if symbol in active_positions:  # Перевіряємо що позиція ще існує
+                                                current_position = active_positions[symbol]
+                                                new_size = current_position['size_usdt'] + add_size
+                                                new_avg_entry = (current_position['avg_entry'] * current_position['size_usdt'] + current_price * add_size) / new_size
+                                            else:
+                                                logging.warning(f"[{symbol}] Позиція не знайдена для усереднення")
+                                                return # ⬅️ ЗМІНЕНО: з continue на return
+                                                # ФІКСОВАНА ЦІЛЬ: +30% прибутку з левериджем (як просив користувач)
+                                                if current_position['side'] == "LONG":
+                                                    new_tp_price = new_avg_entry * (1 + 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+                                                else:  # SHORT
+                                                    new_tp_price = new_avg_entry * (1 - 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+                                                
+                                                active_positions[symbol].update({
+                                                    'avg_entry': new_avg_entry,
+                                                    'size_usdt': new_size,
+                                                    'adds_done': current_position['adds_done'] + 1,
+                                                    'last_add_price': ref_price,
+                                                    'tp_price': new_tp_price,
+                                                    'last_add_time': current_time
+                                                })
+                                                
+                                                # 🔍 ДЕТАЛЬНЕ ЛОГУВАННЯ оновлення позиції  
+                                                logging.info(f"✅ ПОЗИЦІЯ ОНОВЛЕНА: adds_done {current_position['adds_done']} -> {current_position['adds_done'] + 1}, розмір ${current_position['size_usdt']:.2f} -> ${new_size:.2f}")
+                                        
+                                        # 🔍 ВИПРАВЛЕНО: використовуємо оновлене значення adds_done
+                                        updated_adds = current_position['adds_done'] + 1
+                                        logging.info(f"✅ УСЕРЕДНЕННЯ ЗАВЕРШЕНО {position['side']} на {symbol}: нова avg_entry={new_avg_entry:.6f}, розмір=${new_size:.2f}, додавань={updated_adds}/{AVERAGING_MAX_ADDS}")
+            else:
+                if not spread_check:
+                    logging.debug(f"[{symbol}] Спред {abs(spread_pct):.3f}% < {MIN_SPREAD}%")
+                elif not positions_check and not has_position:
+                    logging.info(f"[{symbol}] ❌ Занадто багато позицій: {total_positions} >= {MAX_OPEN_POSITIONS}")
+                elif not balance_check:
+                    logging.info(f"[{symbol}] ❌ Недостатньо балансу: потрібно {required_margin:.4f} USDT, є {available_balance:.4f} USDT")
+        except Exception as balance_error:
+            logging.exception("Balance check error with full traceback")
+
+        # 4) 🔒 АВТОМАТИЧНЕ ЗАКРИТТЯ ПРИ СПРЕДІ 30% З ЗАХИСТОМ
+        with active_positions_lock:
+            if symbol in active_positions:
+                position = active_positions[symbol].copy()  # Копіюємо для роботи поза локом
+            else:
+                position = None
+        
+        if position:
+            
+            # ✅ НОВІ УМОВИ ВИХОДУ (як просив користувач):
+            # 1) Основна ціль: +30% прибутку
+            # 2) При зникненні спреду: дострокове закриття на +10-15%
+            
+            current_price = ref_price  # Завжди XT ціна
+            entry_price = position['avg_entry']
+            
+            # Розрахунок поточного P&L у відсотках
+            if position['side'] == "LONG":
+                pnl_pct = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
+            else:  # SHORT  
+                pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
+            
+            should_close = False
+            close_reason = ""
+            
+            # 1) ОСНОВНА ЦІЛЬ: +30% прибутку (примусове закриття)
+            if pnl_pct >= 30.0:
+                should_close = True
+                close_reason = f"🎯 ДОСЯГНУТО ЦІЛЬ +30%! P&L={pnl_pct:.1f}%"
+                
+            # 2) ДОСТРОКОВЕ ЗАКРИТТЯ: спред зникає + прибуток 10-15%
+            elif abs(spread_pct) < 0.3 and 10.0 <= pnl_pct < 30.0:  # спред < 0.3% вважається "зниклим"
+                should_close = True
+                close_reason = f"⚡ ДОСТРОКОВЕ ЗАКРИТТЯ: спред зник ({abs(spread_pct):.2f}% < 0.3%) + прибуток {pnl_pct:.1f}% (в межах 10-30%)"
+                
+            # 3) ЗАХИСТ: спред > 30% (як було раніше)
+            elif abs(spread_pct) >= 30.0:
+                should_close = True 
+                close_reason = f"🚨 АВАРІЙНЕ ЗАКРИТТЯ: спред {abs(spread_pct):.2f}% >= 30%"
+            
+            if should_close:
+                logging.warning(f"🚨 АВТОЗАКРИТТЯ {position['side']} {symbol}: {close_reason}")
+                
+                # БЕЗПЕЧНЕ ЗАКРИТТЯ: спочатку закриваємо на біржі, потім видаляємо з системи
+                try:
+                    # Отримуємо свіжу ціну для точного закриття
+                    fresh_ticker = fetch_ticker(xt, symbol)
+                    if fresh_ticker:
+                        current_xt_price = float(fresh_ticker['last'])
+                    else:
+                        current_xt_price = ref_price  # fallback
+                    
+                    # ПЕРЕВІРЯЄМО ЧИ ІСНУЄ ПОЗИЦІЯ ПЕРЕД ЗАКРИТТЯМ
+                    # Отримуємо свіжі позиції з біржі
+                    try:
+                        # 🔧 ВИКОРИСТОВУЄМО БЕЗПЕЧНИЙ WRAPPER
+                        # Gate.io відключено - використовуємо тільки XT  
+                        # Gate.io відключено - використовуємо тільки XT positions
+                        current_positions = []
+                        has_real_position = False
+                        for pos in current_positions:
+                            if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
+                                has_real_position = True
+                                break
+                        
+                        if not has_real_position:
+                            logging.warning(f"🚨 ПОЗИЦІЯ {symbol} УЖЕ ЗАКРИТА НА БІРЖІ - видаляємо з системи")
                             with active_positions_lock:
                                 if symbol in active_positions:
                                     del active_positions[symbol]
-                            
-                            # ДОДАЄМО ДО ІСТОРІЇ ТОРГІВЛІ
-                            try:
-                                import telegram_admin
-                                telegram_admin.add_to_trade_history(
-                                    symbol=symbol,
-                                    side=position['side'],
-                                    entry_price=position['avg_entry'],
-                                    close_price=current_xt_price,
-                                    pnl=(position['size_usdt'] * pnl_pct / 100),
-                                    close_reason=close_reason,
-                                    exchange="Gate.io"
-                                )
-                                logging.info(f"📚 Додано до історії: {symbol} P&L={pnl_pct:+.1f}%")
-                            except Exception as history_error:
-                                logging.error(f"❌ Помилка додавання до історії: {history_error}")
-                            
-                            # Визначаємо емодзі результату
-                            if pnl_pct > 0:
-                                result_emoji = "💚"
-                                result_text = f"+${(position['size_usdt'] * pnl_pct / 100):+.2f}"
-                            elif pnl_pct < 0:
-                                result_emoji = "❤️"
-                                result_text = f"${(position['size_usdt'] * pnl_pct / 100):+.2f}"
-                            else:
-                                result_emoji = "💙"
-                                result_text = "$0.00"
-                            
-                            # 🎯 РОЗШИРЕНЕ ДЕТАЛЬНЕ СПОВІЩЕННЯ ПРО АВТОЗАКРИТТЯ (як просив користувач!)
-                            close_signal = f"🎯 **АВТОЗАКРИТТЯ ПОЗИЦІЇ** {result_emoji}\n"\
-                                         f"📊 **{symbol.replace('/USDT:USDT', '')}** ({position['side']}) | ⚡ XT.COM\n"\
-                                         f"💰 Розмір: **${position['size_usdt']:.2f} USDT** | Леверидж: **{LEVERAGE}x**\n"\
-                                         f"📈 Вхід: **${position['avg_entry']:.6f}**\n"\
-                                         f"📉 Вихід: **${current_xt_price:.6f}**\n"\
-                                         f"💎 P&L: **{pnl_pct:+.1f}%** ({result_text})\n"\
-                                         f"📊 Спред: **{abs(spread_pct):.2f}%**\n"\
-                                         f"🎯 Причина: **{close_reason}**\n"\
-                                         f"⏰ Час: {datetime.now().strftime('%H:%M:%S')}\n"\
-                                         f"✅ Статус: **УСПІШНО ЗАКРИТО** | #ArbitrageBot"
-                            
-                            # 📊 ПОЗИЦІЇ ОБОМ АДМІНАМ + ГРУПІ
-                            send_to_admins_and_group(close_signal)
-                            logging.info(f"✅ АВТОЗАКРИТО {position['side']} {symbol}: спред={abs(spread_pct):.2f}%, розмір=${position['size_usdt']:.2f}")
-                            continue  # Пропускаємо перевірку TP
-                        else:
-                            # 🔥 КРИТИЧНЕ ВИПРАВЛЕННЯ: НЕ відправляємо Telegram для нормальних помилок автозакриття
-                            logging.info(f"⚠️ Автозакриття {position['side']} {symbol} не вдалося - це може бути нормально (позиція вже закрита)")
-                            # Позиція залишається в active_positions для подальшого управління
-                            
-                    except Exception as close_error:
-                        # 🔥 КРИТИЧНЕ ВИПРАВЛЕННЯ: Використовуємо ту саму логіку фільтрації як у close_position_market
-                        error_str = str(close_error).lower()
-                        normal_errors = [
-                            "reduce_exceeded", "empty position", "position not found",
-                            "insufficient margin", "position already closed", "order not found",
-                            "rate limit", "timeout", "connection", "network"
-                        ]
-                        is_normal_error = any(err in error_str for err in normal_errors)
+                            return # ⬅️ ЗМІНЕНО: з continue на return
+                    except:
+                        logging.warning(f"⚠️ Не вдалося перевірити позиції - пробуємо закрити")
+                    
+                    # Пробуємо закрити позицію на біржі
+                    close_success = close_position_market(symbol, position['side'], position['size_usdt'])
+                    
+                    if close_success:
+                        # 🔒 ТІЛЬКИ якщо закриття успішне - видаляємо з системи
+                        with active_positions_lock:
+                            if symbol in active_positions:
+                                del active_positions[symbol]
                         
-                        if is_normal_error:
-                            logging.info(f"⚠️ Нормальна помилка автозакриття {symbol}: {error_str[:50]}... (без сповіщення)")
+                        # ДОДАЄМО ДО ІСТОРІЇ ТОРГІВЛІ
+                        try:
+                            import telegram_admin
+                            telegram_admin.add_to_trade_history(
+                                symbol=symbol,
+                                side=position['side'],
+                                entry_price=position['avg_entry'],
+                                close_price=current_xt_price,
+                                pnl=(position['size_usdt'] * pnl_pct / 100),
+                                close_reason=close_reason,
+                                exchange="Gate.io"
+                            )
+                            logging.info(f"📚 Додано до історії: {symbol} P&L={pnl_pct:+.1f}%")
+                        except Exception as history_error:
+                            logging.error(f"❌ Помилка додавання до історії: {history_error}")
+                        
+                        # Визначаємо емодзі результату
+                        if pnl_pct > 0:
+                            result_emoji = "💚"
+                            result_text = f"+${(position['size_usdt'] * pnl_pct / 100):+.2f}"
+                        elif pnl_pct < 0:
+                            result_emoji = "❤️"
+                            result_text = f"${(position['size_usdt'] * pnl_pct / 100):+.2f}"
                         else:
-                            logging.error(f"❌ КРИТИЧНА ПОМИЛКА при автозакритті {symbol}: {close_error}")
-                            # ТІЛЬКИ для справді критичних помилок відправляємо в Telegram
-                            error_signal = f"🚨 **КРИТИЧНА СИСТЕМНА ПОМИЛКА!**\n"\
-                                         f"📊 Символ: **{symbol.replace('/USDT:USDT', '')}** ({position['side']})\n"\
-                                         f"💰 Розмір позиції: **${position['size_usdt']:.2f}**\n"\
-                                         f"📈 Вхід: **${position['avg_entry']:.6f}**\n"\
-                                         f"📉 Поточна ціна: **${ref_price:.6f}**\n"\
-                                         f"📊 P&L: **{pnl_pct:+.1f}%**\n"\
-                                         f"⚠️ Спред: **{abs(spread_pct):.2f}%**\n"\
-                                         f"🎯 Причина: {close_reason}\n"\
-                                         f"❌ **ПОМИЛКА API**: `{str(close_error)[:100]}...`\n"\
-                                         f"🏪 Біржа: **{position.get('exchange', 'gate').upper()}**\n"\
-                                         f"⏰ Час: **{time.strftime('%H:%M:%S %d.%m.%Y')}**\n"\
-                                         f"🚨 **ТЕРМІНОВО ПОТРІБНЕ РУЧНЕ ВТРУЧАННЯ!**"
-                            # 🚨 КРИТИЧНІ ПОМИЛКИ ОБОМ АДМІНАМ + ГРУПІ
-                            send_to_admins_and_group(error_signal)
-                        # Позиція залишається в системі для подальшого управління
+                            result_emoji = "💙"
+                            result_text = "$0.00"
+                        
+                        # 🎯 РОЗШИРЕНЕ ДЕТАЛЬНЕ СПОВІЩЕННЯ ПРО АВТОЗАКРИТТЯ (як просив користувач!)
+                        close_signal = f"🎯 **АВТОЗАКРИТТЯ ПОЗИЦІЇ** {result_emoji}\n"\
+                                     f"📊 **{symbol.replace('/USDT:USDT', '')}** ({position['side']}) | ⚡ XT.COM\n"\
+                                     f"💰 Розмір: **${position['size_usdt']:.2f} USDT** | Леверидж: **{LEVERAGE}x**\n"\
+                                     f"📈 Вхід: **${position['avg_entry']:.6f}**\n"\
+                                     f"📉 Вихід: **${current_xt_price:.6f}**\n"\
+                                     f"💎 P&L: **{pnl_pct:+.1f}%** ({result_text})\n"\
+                                     f"📊 Спред: **{abs(spread_pct):.2f}%**\n"\
+                                     f"🎯 Причина: **{close_reason}**\n"\
+                                     f"⏰ Час: {datetime.now().strftime('%H:%M:%S')}\n"\
+                                     f"✅ Статус: **УСПІШНО ЗАКРИТО** | #ArbitrageBot"
+                        
+                        # 📊 ПОЗИЦІЇ ОБОМ АДМІНАМ + ГРУПІ
+                        send_to_admins_and_group(close_signal)
+                        logging.info(f"✅ АВТОЗАКРИТО {position['side']} {symbol}: спред={abs(spread_pct):.2f}%, розмір=${position['size_usdt']:.2f}")
+                        return  # ⬅️ ЗМІНЕНО: з continue на return
+                    else:
+                        # 🔥 КРИТИЧНЕ ВИПРАВЛЕННЯ: НЕ відправляємо Telegram для нормальних помилок автозакриття
+                        logging.info(f"⚠️ Автозакриття {position['side']} {symbol} не вдалося - це може бути нормально (позиція вже закрита)")
+                        # Позиція залишається в active_positions для подальшого управління
+                        
+                except Exception as close_error:
+                    # 🔥 КРИТИЧНЕ ВИПРАВЛЕННЯ: Використовуємо ту саму логіку фільтрації як у close_position_market
+                    error_str = str(close_error).lower()
+                    normal_errors = [
+                        "reduce_exceeded", "empty position", "position not found",
+                        "insufficient margin", "position already closed", "order not found",
+                        "rate limit", "timeout", "connection", "network"
+                    ]
+                    is_normal_error = any(err in error_str for err in normal_errors)
+                    
+                    if is_normal_error:
+                        logging.info(f"⚠️ Нормальна помилка автозакриття {symbol}: {error_str[:50]}... (без сповіщення)")
+                    else:
+                        logging.error(f"❌ КРИТИЧНА ПОМИЛКА при автозакритті {symbol}: {close_error}")
+                        # ТІЛЬКИ для справді критичних помилок відправляємо в Telegram
+                        error_signal = f"🚨 **КРИТИЧНА СИСТЕМНА ПОМИЛКА!**\n"\
+                                     f"📊 Символ: **{symbol.replace('/USDT:USDT', '')}** ({position['side']})\n"\
+                                     f"💰 Розмір позиції: **${position['size_usdt']:.2f}**\n"\
+                                     f"📈 Вхід: **${position['avg_entry']:.6f}**\n"\
+                                     f"📉 Поточна ціна: **${ref_price:.6f}**\n"\
+                                     f"📊 P&L: **{pnl_pct:+.1f}%**\n"\
+                                     f"⚠️ Спред: **{abs(spread_pct):.2f}%**\n"\
+                                     f"🎯 Причина: {close_reason}\n"\
+                                     f"❌ **ПОМИЛКА API**: `{str(close_error)[:100]}...`\n"\
+                                     f"🏪 Біржа: **{position.get('exchange', 'gate').upper()}**\n"\
+                                     f"⏰ Час: **{time.strftime('%H:%M:%S %d.%m.%Y')}**\n"\
+                                     f"🚨 **ТЕРМІНОВО ПОТРІБНЕ РУЧНЕ ВТРУЧАННЯ!**"
+                        # 🚨 КРИТИЧНІ ПОМИЛКИ ОБОМ АДМІНАМ + ГРУПІ
+                        send_to_admins_and_group(error_signal)
+                    # Позиція залишається в системі для подальшого управління
+            
+            # ВИДАЛЕНО: стара логіка 25% TP - замінена на нову логіку 30% вище
+
+    except Exception as e:
+        # ДЕТАЛЬНЕ ЛОГУВАННЯ ГЛОБАЛЬНИХ ПОМИЛОК ВОРКЕРА
+        error_msg = f"⚠️ **ПОМИЛКА ВОРКЕРА СИМВОЛУ**\n"\
+                   f"📊 Символ: **{symbol.replace('/USDT:USDT', '')}**\n"\
+                   f"❌ Помилка: `{str(e)[:150]}...`\n"\
+                   f"🔧 Воркер продовжує роботу через 30 сек\n"\
+                   f"⏰ Час: **{time.strftime('%H:%M:%S')}**"
+        # Відправляємо тільки у випадку серйозних помилок (не часті дрібниці)  
+        if "timeout" not in str(e).lower() and "rate limit" not in str(e).lower():
+            # 🚨 ПОМИЛКИ ВОРКЕРА ОБОМ АДМІНАМ + ГРУПІ
+            send_to_admins_and_group(error_msg)
+        logging.error("Symbol worker error %s %s", symbol, e)
+
+    # ⛔️ ВИДАЛЕНО: time.sleep(SCAN_INTERVAL)
+    logging.info(f"Worker finished for {symbol}") # ⬅️ ЗМІНЕНО: логування завершення
+
+# def symbol_worker(symbol):
+#     """
+#     Робота по одному символу з усередненням позицій: fetch ticker, dex price via dexscreener, calc spread, check liquidity, open/average/close
+#     """
+#     logging.info("Worker started for %s", symbol)
+#     while bot_running:
+#         try:
+#             if not trade_symbols.get(symbol, False):
+#                 time.sleep(1)
+#                 continue
+
+#             # 1) ТІЛЬКИ XT БІРЖА - отримуємо ціну з XT (як просив користувач)
+#             xt_price = None
+#             if not (xt_markets_available and xt):
+#                 logging.debug(f"[{symbol}] ❌ XT біржа недоступна")
+#                 time.sleep(SCAN_INTERVAL)
+#                 continue
                 
-                # ВИДАЛЕНО: стара логіка 25% TP - замінена на нову логіку 30% вище
+#             try:
+#                 xt_price = get_xt_price(xt, symbol)
+#                 if not xt_price or not is_xt_futures_tradeable(symbol):
+#                     logging.debug(f"[{symbol}] ❌ Неможливо торгувати на XT futures")
+#                     time.sleep(SCAN_INTERVAL)
+#                     continue
+#                 logging.debug(f"[{symbol}] ✅ XT ціна: ${xt_price:.6f}")
+#             except Exception as e:
+#                 logging.debug(f"[{symbol}] ⚠️ XT ціна недоступна: {e}")
+#                 time.sleep(SCAN_INTERVAL)
+#                 continue
 
-        except Exception as e:
-            # ДЕТАЛЬНЕ ЛОГУВАННЯ ГЛОБАЛЬНИХ ПОМИЛОК ВОРКЕРА
-            error_msg = f"⚠️ **ПОМИЛКА ВОРКЕРА СИМВОЛУ**\n"\
-                       f"📊 Символ: **{symbol.replace('/USDT:USDT', '')}**\n"\
-                       f"❌ Помилка: `{str(e)[:150]}...`\n"\
-                       f"🔧 Воркер продовжує роботу через 30 сек\n"\
-                       f"⏰ Час: **{time.strftime('%H:%M:%S')}**"
-            # Відправляємо тільки у випадку серйозних помилок (не часті дрібниці)  
-            if "timeout" not in str(e).lower() and "rate limit" not in str(e).lower():
-                # 🚨 ПОМИЛКИ ВОРКЕРА ОБОМ АДМІНАМ + ГРУПІ
-                send_to_admins_and_group(error_msg)
-            logging.error("Symbol worker error %s %s", symbol, e)
+#             # 2) ТІЛЬКИ ТОДІ DexScreener - отримуємо РОЗШИРЕНІ МЕТРИКИ
+#             try:
+#                 # 🔬 РОЗШИРЕНИЙ АНАЛІЗ: ліквідність, FDV, market cap, транзакції, покупці/продавці
+#                 advanced_metrics = get_advanced_token_analysis(symbol)
+#                 if not advanced_metrics:
+#                     logging.debug(f"[{symbol}] ❌ Немає якісної пари на DexScreener")
+#                     time.sleep(SCAN_INTERVAL)
+#                     continue
+                    
+#                 # Отримуємо базові дані (backward compatibility)
+#                 token_info = {
+#                     'price_usd': advanced_metrics.get('price_usd', 0),
+#                     'liquidity': advanced_metrics.get('liquidity', 0),
+#                     'volume_24h': advanced_metrics.get('volume_24h', 0),
+#                     'dex_link': advanced_metrics.get('exact_pair_url') or get_proper_dexscreener_link(symbol)
+#                 }
+                
+#                 # Коротка інформація про токен (зменшено логування)
+#                 logging.info(f"📊 {symbol}: ${advanced_metrics.get('price_usd', 0):.6f} | Vol ${advanced_metrics.get('volume_1h', 0):,.0f}")
+                    
+#                 if not token_info:
+#                     logging.debug(f"[{symbol}] ❌ Немає якісної пари на DexScreener")
+#                     time.sleep(SCAN_INTERVAL)
+#                     continue
+                
+#                 dex_price = token_info['price_usd']
+                
+#                 # ЖОРСТКІ ПЕРЕВІРКИ (як у топових арбітражних ботів)
+#                 if not dex_price or dex_price < 0.000001:  # мінімальна ціна $0.000001
+#                     raise Exception(f"Invalid DexScreener price: {dex_price}")
+                    
+#             except Exception as e:
+#                 # БЛОКУЄМО токени з поганими DexScreener цінами - як у друга з Bybit
+#                 logging.warning(f"[{symbol}] ❌ Пропускаємо через погану DexScreener ціну: {e}")
+#                 time.sleep(SCAN_INTERVAL)
+#                 continue
 
-        # невелика пауза
-        time.sleep(SCAN_INTERVAL)
+#             # 3) ТІЛЬКИ XT vs DexScreener АРБІТРАЖ (Gate.io ВІДКЛЮЧЕНО)
+#             if not xt_price:
+#                 logging.debug(f"[{symbol}] ❌ XT ціна недоступна")
+#                 time.sleep(SCAN_INTERVAL)
+#                 continue
+                
+#             # Розраховуємо спред XT vs DexScreener
+#             xt_dex_spread = calculate_spread(dex_price, xt_price)
+#             best_spread = xt_dex_spread
+#             best_direction = "LONG" if xt_price < dex_price else "SHORT" 
+#             best_exchange_pair = "XT vs Dex"
+#             trading_exchange = "xt"  # ЗАВЖДИ торгуємо на XT
+#             ref_price = xt_price  # ВИПРАВЛЕНО: XT ціна для XT біржі
+            
+#             spread_pct = best_spread
+#             spread_store.append(spread_pct)
+            
+#             # Покращене логування тільки з XT та DexScreener
+#             clean_symbol = symbol.replace('/USDT:USDT', '')
+#             log_info = f"XT: ${xt_price:.6f} | Dex: ${dex_price:.6f} | Спред: {best_spread:.2f}% {best_direction} | Торгуємо на: XT"
+#             logging.info(f"[{clean_symbol}] {log_info}")
+            
+#             # 🚀 НОВІ ФІШКИ: Розумна аналітика ПІСЛЯ встановлення trading_exchange
+#             volatility = calculate_volatility_indicator(symbol, trading_exchange)
+#             volume_analysis = analyze_volume_quality(symbol, token_info, trading_exchange)
+#             smart_timing = smart_entry_timing(symbol, abs(spread_pct), volatility, volume_analysis)
+            
+#             # Логування нових фішок
+#             # Аналіз якості токена (логування зменшено)
+#             if volatility.get('status') == 'success' and smart_timing.get('status') == 'success':
+#                 logging.info(f"[{clean_symbol}] 📊 Волатільність: {volatility['volatility']}% | Тайминг: {smart_timing['grade']}")
+            
+#             # ✅ ПОВНА АВТОМАТИЗАЦІЯ - БЕЗ БЛОКИРОВОК!
+#             enhanced_entry_check = True
+            
+#             # Інформаційні повідомлення (БЕЗ БЛОКУВАННЯ!)
+#             # Попередження тільки для критичних випадків
+#             if volatility.get('risk_level') == 'EXTREME' and volatility.get('volatility', 0) > 30:
+#                 logging.info(f"[{clean_symbol}] ⚠️ Висока волатільність {volatility.get('volatility', 0)}% - торгуємо обережно")
+            
+#             # НЕ спамимо про кожну арбітражну можливість - тільки про реальні торгові операції
+
+#             # 3) Перевірка балансу перед торгівлею
+#             # МАРЖА ЗА НАЛАШТУВАННЯМ (збільшено для торгівлі дорожчими токенами)
+#             required_margin = float(ORDER_AMOUNT)  # Примусове приведення до float
+            
+#             # 🔒 THREAD-SAFE БАЛАНС (Task 6: захист від одночасних перевірок балансу)
+#             try:
+#                 with balance_check_lock:  # ЗАХИСТ: тільки один worker перевіряє баланс одночасно
+#                     # Видалено DEBUG логування для чистоти
+                    
+#                     # ✅ ТІЛЬКИ XT.COM БІРЖА - ОБИДВА АКАУНТИ
+#                     if trading_exchange == "xt":
+#                         # Баланс акаунта 1
+#                         balance_1 = get_xt_futures_balance(xt_account_1)
+#                         available_balance_1 = float(balance_1.get('free', 0.0))
+#                         # Баланс акаунта 2
+#                         balance_2 = get_xt_futures_balance(xt_account_2)
+#                         available_balance_2 = float(balance_2.get('free', 0.0))
+#                         # Загальний доступний баланс
+#                         available_balance = available_balance_1 + available_balance_2
+#                         logging.info(f"💰 XT.com АКАУНТ 1: ${balance_1['total']:.2f} USDT (доступно ${available_balance_1:.2f})")
+#                         logging.info(f"💰 XT.com АКАУНТ 2: ${balance_2['total']:.2f} USDT (доступно ${available_balance_2:.2f})")
+#                         logging.info(f"💰 ЗАГАЛОМ: ${balance_1['total'] + balance_2['total']:.2f} USDT (доступно ${available_balance:.2f})")
+#                     else:
+#                         # Якщо trading_exchange не XT - пропускаємо
+#                         logging.warning(f"[{symbol}] ⚠️ Підтримуємо тільки XT біржу, пропускаємо: {trading_exchange}")
+#                         continue
+                        
+#                     # Детальне логування умов торгівлі
+#                     spread_check = abs(spread_pct) >= MIN_SPREAD
+#                     balance_check = available_balance >= required_margin
+                    
+#                     # 🔒 Перевірка кількості активних позицій з ЗАХИСТОМ (поза balance_check_lock)
+#                     with active_positions_lock:
+#                         total_positions = len(active_positions)
+#                         has_position = symbol in active_positions
+#                     positions_check = total_positions < MAX_OPEN_POSITIONS
+                
+                
+#                 # 🔥 ПОКРАЩЕНІ ФІЛЬТРИ РЕАЛЬНОСТІ - відсіюємо фейкові арбітражі!
+#                 is_realistic = True
+                
+#                 # 1. РОЗУМНИЙ спред фільтр: різні ліміти для різних монет
+#                 clean_symbol = symbol.replace('/USDT:USDT', '')
+                
+#                 # Основні монети (ETH, BTC тощо) - більш жорсткі ліміти
+#                 major_tokens = ['ETH', 'BTC', 'BNB', 'ADA', 'SOL', 'MATIC', 'AVAX', 'DOT', 'LINK']
+#                 max_spread_limit = 50.0  # ПОЛІПШЕНО: максимум 50% для блокування фейків
+                
+#                 # ЖОРСТКА перевірка фейкових спредів  
+#                 if abs(spread_pct) > max_spread_limit:
+#                     logging.warning(f"[{symbol}] ❌ ФЕЙК: Нереальний спред {spread_pct:.2f}% > {max_spread_limit}%")
+#                     is_realistic = False
+                
+#                 # БЛОКУВАННЯ НЕГАТИВНИХ СПРЕДІВ (очевидні фейки)
+#                 if spread_pct < -25.0:  # Негативні спреди більше -25% завжди фейкові  
+#                     logging.warning(f"[{symbol}] ❌ ФЕЙК: Негативний спред {spread_pct:.2f}% заблоковано")
+#                     is_realistic = False
+                
+#                 # 2. РОЗСЛАБЛЕНА перевірка співвідношення цін для більше можливостей
+#                 price_ratio = max(xt_price, dex_price) / min(xt_price, dex_price)
+#                 max_price_ratio = 2.5  # РОЗСЛАБЛЕНО: 2.5x для всіх монет для більше сигналів
+                
+#                 if price_ratio > max_price_ratio:
+#                     logging.warning(f"[{symbol}] ❌ ФЕЙК: Ціни відрізняються в {price_ratio:.2f} разів (макс. {max_price_ratio:.1f}x)")
+#                     is_realistic = False
+                
+#                 # 3. АБСОЛЮТНА перевірка цін для топ-монет (як ETH $3701 vs $4601)  
+#                 if clean_symbol in major_tokens:
+#                     # Перевіряємо що цінди в розумних межах для топ-монет
+#                     expected_ranges = {
+#                         'ETH': (2000, 6000),    # ETH очікується $2000-6000
+#                         'BTC': (30000, 100000), # BTC очікується $30k-100k  
+#                         'BNB': (200, 1000),     # BNB очікується $200-1000
+#                         'SOL': (50, 500),       # SOL очікується $50-500
+#                         'ADA': (0.2, 3.0),      # ADA очікується $0.2-3.0
+#                     }
+                    
+#                     if clean_symbol in expected_ranges:
+#                         min_price, max_price = expected_ranges[clean_symbol]
+#                         if not (min_price <= xt_price <= max_price) or not (min_price <= dex_price <= max_price):
+#                             logging.warning(f"[{symbol}] ❌ ФЕЙК: Ціна поза межами для {clean_symbol}: XT=${xt_price:.2f}, Dex=${dex_price:.2f} (очікується ${min_price}-${max_price})")
+#                             is_realistic = False
+                
+#                 # 4. ЖОРСТКІ ФІЛЬТРИ: Мінімальна ліквідність та обсяг для торгівлі (як просив користувач)
+#                 min_liquidity = token_info.get('liquidity', 0)
+#                 min_volume_24h = token_info.get('volume_24h', 0)
+                
+#                 if min_liquidity < MIN_POOLED_LIQUIDITY_USD:  # ФІЛЬТР з config.py
+#                     logging.warning(f"[{symbol}] ❌ ФЕЙК: Мала ліквідність ${min_liquidity:,.0f} < ${MIN_POOLED_LIQUIDITY_USD:,}")
+#                     is_realistic = False
+                    
+#                 if min_volume_24h < MIN_24H_VOLUME_USD:  # ФІЛЬТР з config.py
+#                     logging.warning(f"[{symbol}] ❌ ФЕЙК: Малий обсяг ${min_volume_24h:,.0f} < ${MIN_24H_VOLUME_USD:,}")
+#                     is_realistic = False
+                
+#                 # 5. Перевіряємо що це не стейблкоїн або заблоковані токени
+#                 blacklisted_tokens = ['USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'FDUSD', 'TON']
+#                 if any(token in clean_symbol for token in blacklisted_tokens):
+#                     logging.info(f"[{symbol}] ❌ ЗАБЛОКОВАНО: Токен {clean_symbol} в чорному списку")
+#                     is_realistic = False
+                
+#                 # 6. ДОДАТКОВО: Перевірка кратності цін (виявляє деякі фейки)
+#                 if xt_price > 0 and dex_price > 0:
+#                     # Якщо одна ціна є точним кратним іншої (x10, x100), це може бути помилка
+#                     ratio_check = xt_price / dex_price
+#                     if abs(ratio_check - round(ratio_check)) < 0.01 and round(ratio_check) >= 10:
+#                         logging.warning(f"[{symbol}] ❌ ФЕЙК: Підозрюване кратне співвідношення цін {ratio_check:.1f}x")
+#                         is_realistic = False
+                
+#                 # АВТОСИГНАЛИ: Окремі сигнали для кожної пари бірж >= MIN_SPREAD
+                
+#                 # Логування нових фішок
+#                 if volatility.get('status') == 'success':
+#                     # Компактний звіт якості (зменшено логування)
+#                     if volatility.get('status') == 'success' and volume_analysis.get('status') == 'success':
+#                         logging.info(f"[{symbol}] 📊 Vol: {volatility['volatility']}% | Об'єм: ${volume_analysis['total_volume']:,.0f} | Тайминг: {smart_timing.get('grade', 'N/A')}")
+                
+#                 # Підвищуємо вимоги до входу на основі нових фішок
+#                 enhanced_entry_check = True
+                
+#                 # 🎯 ДОЗВОЛЕНО: Блокування тільки найгірших сигналів (дозволяємо FAIR тайминг)
+#                 timing_recommendation = smart_timing.get('recommendation', 'WAIT')
+#                 if timing_recommendation in ['SKIP_SIGNAL']:  # Тільки SKIP_SIGNAL, WAIT/CONSIDER дозволені
+#                     logging.warning(f"[{symbol}] ❌ БЛОКОВАНИЙ СИГНАЛ: таймінг {smart_timing.get('grade')} ({smart_timing.get('timing_score', 0)} балів)")
+#                     enhanced_entry_check = False  # БЛОКУЄМО тільки найгірші сигнали
+                
+#                 # Блокуємо при екстремальній волатильності
+#                 if volatility.get('risk_level') == 'EXTREME':
+#                     logging.info(f"[{symbol}] 📊 ІНФО: Висока волатільність {volatility.get('volatility', 0)}% але торгуємо далі")
+#                     # БЕЗ БЛОКУВАННЯ enhanced_entry_check залишається True
+                
+#                 # Блокуємо при низькому об'ємі
+#                 if volume_analysis.get('quality_score', 0) <= 1:
+#                     logging.warning(f"[{symbol}] 📈 БЛОКОВАНО: Занадто низький об'єм ${volume_analysis.get('total_volume', 0):,.0f}")
+#                     enhanced_entry_check = False
+                
+#                 # 🛡️ ПЕРЕВІРЯЄМО ІСНУЮЧІ ПОЗИЦІЇ ПЕРЕД ВІДПРАВКОЮ СИГНАЛІВ
+#                 with active_positions_lock:
+#                     already_has_position = symbol in active_positions
+
+#                 # 🎯 НОВА ЛОГІКА: ЗБИРАЄМО МОЖЛИВОСТІ БЕЗ БАЛАНСОВИХ ОБМЕЖЕНЬ ДЛЯ НАЙКРАЩИХ СИГНАЛІВ
+#                 logging.info(f"🔍 ПЕРЕВІРКА СИГНАЛУ {symbol}: realistic={is_realistic}, entry_check={enhanced_entry_check}, has_position={already_has_position}")
+#                 if is_realistic and enhanced_entry_check and not already_has_position:
+#                     # 1. XT vs DexScreener (ТІЛЬКИ XT БІРЖА)
+#                     xt_dex_spread_pct = calculate_spread(dex_price, xt_price)
+#                     if abs(xt_dex_spread_pct) >= MIN_SPREAD:
+#                         current_time = time.time()
+#                         logging.info(f"🔥 СИГНАЛ ЗНАЙДЕНО: {symbol} спред={xt_dex_spread_pct:.2f}% (мін={MIN_SPREAD}%, макс={MAX_SPREAD}%)")
+                        
+#                         # 🎯 ЗБИРАЄМО ДЛЯ НАЙКРАЩИХ СИГНАЛІВ (БЕЗ КУЛДАУН ПЕРЕВІРКИ ТУТ)
+#                         side = "LONG" if xt_dex_spread_pct > 0 else "SHORT"
+                        
+#                         # Розраховуємо рейтинг можливості для пошуку найкращого
+#                         liquidity = advanced_metrics.get('liquidity', 0)
+#                         volume_24h = advanced_metrics.get('volume_24h', 0) 
+#                         score = abs(xt_dex_spread_pct) * 100 + (liquidity / 1000) + (volume_24h / 10000)
+                        
+#                         # ✅ ДОДАЄМО В СИСТЕМУ НАЙКРАЩИХ МОЖЛИВОСТЕЙ (БЕЗ БАЛАНСОВИХ ОБМЕЖЕНЬ)
+#                         with opportunities_lock:
+#                             best_opportunities[symbol] = {
+#                                 'spread': xt_dex_spread_pct,
+#                                 'side': side,
+#                                 'score': score,
+#                                 'timestamp': current_time,
+#                                 'xt_price': xt_price,
+#                                 'dex_price': dex_price,
+#                                 'token_info': token_info,
+#                                 'advanced_metrics': advanced_metrics
+#                             }
+                        
+#                         logging.info(f"[{symbol}] 🏆 ДОДАНО ДО НАЙКРАЩИХ: {side} спред={xt_dex_spread_pct:.2f}% (рейтинг={score:.1f})")
+                        
+#                         # 🚨 НОВА ЛОГІКА: НЕГАЙНЕ ВІДПРАВЛЕННЯ СИГНАЛУ НЕЗАЛЕЖНО ВІД БАЛАНСУ!
+#                         # Відправляємо сигнал одразу після знаходження можливості (тільки з кулдауном)
+#                         signal_sent = False
+                        
+#                         with telegram_cooldown_lock:  # КРИТИЧНА СЕКЦІЯ
+#                             last_signal_time = telegram_cooldown.get(symbol, 0)
+#                             time_since_last = current_time - last_signal_time
+                            
+#                             if time_since_last >= TELEGRAM_COOLDOWN_SEC:
+#                                 signal_sent = True
+                                
+#                                 # 🛡️ ВЕРИФІКАЦІЯ СИГНАЛУ (як просить користувач - блокуємо без DEX адреси!)
+#                                 logging.info(f"🔍 ВЕРИФІКУЮ СИГНАЛ: {symbol} {side} спред={xt_dex_spread_pct:.2f}%")
+                                
+#                                 try:
+#                                     # Створюємо ArbitrageSignal об'єкт для верифікації
+#                                     from signal_parser import ArbitrageSignal
+#                                     from signal_verification import verify_arbitrage_signal
+#                                     from telegram_formatter import format_arbitrage_signal_message
+                                    
+#                                     test_signal = ArbitrageSignal(
+#                                         asset=clean_symbol,
+#                                         action=side,
+#                                         spread_percent=xt_dex_spread_pct,
+#                                         xt_price=xt_price,
+#                                         dex_price=dex_price
+#                                     )
+                                    
+#                                     # КРИТИЧНО: Повна верифікація з блокуванням сигналів без DEX адреси
+#                                     verification_result = verify_arbitrage_signal(test_signal)
+                                    
+#                                     if verification_result.valid:
+#                                         # ✅ СИГНАЛ ВАЛІДНИЙ - відправляємо з повною інформацією
+#                                         signal_message = format_arbitrage_signal_message(test_signal, verification_result)
+#                                         logging.info(f"✅ СИГНАЛ ВЕРИФІКОВАНО для {symbol}: DEX знайдено!")
+#                                     else:
+#                                         # 🔄 СИГНАЛ НЕ ВЕРИФІКОВАНО - відправляємо з fallback посиланням
+#                                         logging.info(f"⚠️ ВІДПРАВЛЯЄМО FALLBACK СИГНАЛ для {symbol}: {'; '.join(verification_result.errors)}")
+#                                         signal_message = format_arbitrage_signal_message(test_signal, verification_result, for_group=True)
+#                                         # НЕ блокуємо відправку - відправляємо з fallback посиланнями!
+                                    
+#                                 except Exception as signal_error:
+#                                     logging.error(f"❌ Помилка верифікації сигналу {symbol}: {signal_error}")
+#                                     signal_sent = False
+#                                     signal_message = None
+                        
+#                         # 📱 ВІДПРАВЛЕННЯ В TELEGRAM (ПОЗА ЛОКОМ) - ТІЛЬКИ ВАЛІДНІ СИГНАЛИ!
+#                         signal_message = locals().get('signal_message', None)
+#                         if signal_sent and signal_message:
+#                             try:
+#                                 # 🎯 ТОРГОВІ СИГНАЛИ ОБОМ АДМІНАМ + ГРУПІ
+#                                 success2 = send_to_admins_and_group(signal_message)
+                                
+#                                 if success2:
+#                                     # ТІЛЬКИ ПІСЛЯ УСПІШНОЇ ВІДПРАВКИ встановлюємо кулдаун
+#                                     with telegram_cooldown_lock:
+#                                         telegram_cooldown[symbol] = current_time
+#                                     logging.info(f"📱 СИГНАЛ ВІДПРАВЛЕНО: {symbol} {side} спред={xt_dex_spread_pct:.2f}% (ігноруємо баланс)")
+#                                 else:
+#                                     logging.error(f"❌ Помилка відправки в обидва чати {symbol}")
+                                    
+#                             except Exception as telegram_error:
+#                                 logging.error(f"❌ Помилка Telegram відправки {symbol}: {telegram_error}")
+                        
+#                         # Показуємо кулдаун якщо сигнал заблокований
+#                         if not signal_sent:
+#                             with telegram_cooldown_lock:
+#                                 last_signal_time = telegram_cooldown.get(symbol, 0)
+#                                 time_since_last = current_time - last_signal_time
+#                                 if time_since_last < TELEGRAM_COOLDOWN_SEC:
+#                                     time_left = int(TELEGRAM_COOLDOWN_SEC - time_since_last)
+#                                     logging.info(f"[{symbol}] ⏰ КУЛДАУН: ще {time_left}с до наступного сигналу")
+                        
+#                         # 🔄 СТАРА ЛОГІКА: Тільки для безпосереднього торгування (з балансовими обмеженнями)
+#                         # ПРИМУСОВА МАРЖА $5: купуємо частково для будь-якої монети  
+#                         # Завжди торгуємо на ФІКСОВАНУ маржу $5.00 (можна купити частину монети)
+                        
+#                         time.sleep(5)
+                    
+#                     # 2. XT vs DexScreener (якщо XT доступна)
+#                     if xt_price:
+#                         xt_dex_spread_pct = calculate_spread(dex_price, xt_price)
+#                         if abs(xt_dex_spread_pct) >= MIN_SPREAD:
+#                             # ПРИМУСОВА МАРЖА $5: купуємо частково для будь-якої монети
+#                             # Завжди торгуємо на ФІКСОВАНУ маржу $5.00 (можна купити частину монети)
+#                             # 🕒 THREAD-SAFE КУЛДАУН: синхронізація для багатопоточності
+#                             current_time = time.time()
+#                             signal_sent = False
+                            
+#                             with telegram_cooldown_lock:  # КРИТИЧНА СЕКЦІЯ  
+#                                 last_signal_time = telegram_cooldown.get(symbol, 0)
+#                                 time_since_last = current_time - last_signal_time
+                                
+#                                 if time_since_last >= TELEGRAM_COOLDOWN_SEC:
+#                                     telegram_cooldown[symbol] = current_time  # Одразу встановлюємо час
+#                                     signal_sent = True
+#                                 else:
+#                                     time_left = int(TELEGRAM_COOLDOWN_SEC - time_since_last)
+#                                     logging.info(f"[{symbol}] ⏰ СПІЛЬНИЙ КУЛДАУН: ще {time_left}с до наступного сигналу")
+                            
+#                             # 🎯 ВИДАЛЕНО ДУБЛІКАТ: цей блок дублював логіку з рядків вище
+#                             # Залишаємо тільки систему найкращих сигналів
+                        
+#                         # ВИДАЛЕНО: міжбіржовий арбітраж Gate ↔ XT (залишаємо тільки DEX порівняння)
+#                 elif already_has_position:
+#                     logging.info(f"[{symbol}] ⏹️ ПРОПУСКАЄМО СИГНАЛ: вже є активна позиція")
+#                 elif abs(spread_pct) >= MIN_SPREAD and not is_realistic:
+#                     logging.warning(f"[{symbol}] ❌ БЛОКОВАНИЙ ФЕЙК: спред={spread_pct:.2f}%")
+                
+#                 # РЕАЛЬНА ТОРГІВЛЯ З УСЕРЕДНЕННЯМ
+#                 if spread_check and balance_check and not DRY_RUN and is_realistic:
+#                     side = "LONG" if spread_pct > 0 else "SHORT"
+                    
+#                     # Логіка базового входу або усереднення
+#                     if not has_position and positions_check:
+#                         # БАЗОВИЙ ВХІД: Відкриваємо нову позицію
+#                         logging.info(f"[{symbol}] 🎯 БАЗОВИЙ ВХІД: spread={abs(spread_pct):.3f}% >= {MIN_SPREAD}%, баланс={available_balance:.4f} >= {required_margin:.4f}, позицій={total_positions} < {MAX_OPEN_POSITIONS}")
+
+#                         # СТРОГА перевірка order book ліквідності з правильної біржі
+#                         ok_liq = can_execute_on_orderbook(symbol, ORDER_AMOUNT, ORDER_BOOK_DEPTH, exchange=trading_exchange)
+                        
+#                         # 🔍 ДОДАТКОВА ПЕРЕВІРКА XT order book ліквідності (спеціальна для XT.com)
+#                         if ok_liq and trading_exchange == "xt":
+#                             # ВИПРАВЛЕНО: використовуємо notional size (маржа * леверидж) замість тільки маржі
+#                             notional_size = ORDER_AMOUNT * LEVERAGE
+#                             current_side = "LONG" if spread_pct > 0 else "SHORT"  # Явно визначаємо side
+#                             can_trade_xt, xt_liquidity_info = analyze_xt_order_book_liquidity(xt, symbol, current_side, notional_size, min_liquidity_ratio=2.0)
+#                             if not can_trade_xt:
+#                                 logging.warning(f"[{symbol}] {xt_liquidity_info}")
+#                                 ok_liq = False
+#                             else:
+#                                 logging.info(f"[{symbol}] {xt_liquidity_info}")
+                        
+#                         if ok_liq:
+#                             # ПРИМУСОВЕ встановлення левериджу ПЕРЕД кожною угодою
+#                             if trading_exchange == "xt":
+#                                 try:
+#                                     # Правильний виклик з positionSide
+#                                     position_side = "LONG" if side == "LONG" else "SHORT"
+#                                     xt.set_leverage(LEVERAGE, symbol, {"positionSide": position_side})
+#                                     logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x ({position_side})")
+#                                 except Exception as e:
+#                                     logging.error(f"[{symbol}] ❌ Помилка встановлення левериджу XT: {e}")
+#                                     # Не блокуємо торгівлю, продовжуємо
+#                                     pass
+                                    
+#                                 # 🔒 ORDER PLACEMENT LOCK (Task 6: запобігаємо подвійним ордерам)
+#                                 with order_placement_lock:
+#                                     # 🎯 ПАРАЛЕЛЬНА ТОРГІВЛЯ НА ДВОХ АКАУНТАХ
+#                                     order_account_1 = xt_open_market_position(xt_account_1, symbol, side, ORDER_AMOUNT, LEVERAGE, ref_price, dex_price, spread_pct)
+#                                     order_account_2 = xt_open_market_position(xt_account_2, symbol, side, ORDER_AMOUNT, LEVERAGE, ref_price, dex_price, spread_pct)
+#                                     # Вважаємо успішним якщо хоча б один акаунт відкрив позицію
+#                                     order = order_account_1 or order_account_2
+#                                     if order_account_1:
+#                                         logging.info(f"[{symbol}] ✅ АКАУНТ 1: Відкрито {side} позицію з левериджем {LEVERAGE}x")
+#                                     if order_account_2:
+#                                         logging.info(f"[{symbol}] ✅ АКАУНТ 2: Відкрито {side} позицію з левериджем {LEVERAGE}x")
+#                             else:
+#                                 order = None
+#                             if order:
+#                                     logging.info(f"[{symbol}] 🚀 XT: Відкрито {side} позиції на обох акаунтах з левериджем {LEVERAGE}x")
+#                             # ❌ GATE.IO ВІДКЛЮЧЕНО - тільки XT біржа!
+#                             # else:  # gate (ВІДКЛЮЧЕНО)
+#                             #     order = open_market_position(symbol, side, ORDER_AMOUNT, LEVERAGE, gate_price, dex_price, spread_pct)
+#                             if order:
+#                                 # Створюємо агреговану позицію
+#                                 entry_price = ref_price  # Завжди XT ціна
+#                                 # ФІКСОВАНА ЦІЛЬ: +30% прибутку з левериджем (як просив користувач)
+#                                 if side == "LONG":
+#                                     tp_price = entry_price * (1 + 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+#                                 else:  # SHORT
+#                                     tp_price = entry_price * (1 - 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+#                                 position = {
+#                                     "side": side,
+#                                     "avg_entry": entry_price,
+#                                     "size_usdt": ORDER_AMOUNT,
+#                                     "adds_done": 0,
+#                                     "last_add_price": entry_price,
+#                                     "tp_price": tp_price,
+#                                     "last_add_time": time.time(),
+#                                     "exchange": trading_exchange,  # Запам'ятовуємо на якій біржі торгуємо
+#                                     # 🎯 НОВІ ПОЛЯ ДЛЯ АВТОМАТИЧНОГО ЗАКРИТТЯ
+#                                     "entry_time": time.time(),  # час входу в позицію
+#                                     "arb_pair": f"{trading_exchange}-dex",  # тип арбітражу (gate-dex або xt-dex)
+#                                     "entry_spread_pct": spread_pct,  # початковий спред
+#                                     "entry_ref_price": dex_price,  # референтна ціна DEX на час входу
+#                                     "status": "open"  # статус позиції (open/closing/closed)
+#                                 }
+#                                 # 🔒 ЗАХИСТ: Тільки для НОВИХ позицій встановлюємо таймери
+#                                 current_time = time.time()
+#                                 existing_position = active_positions.get(symbol, {})
+#                                 if 'opened_at' not in existing_position or existing_position.get('opened_at', 0) <= 0:
+#                                     position['opened_at'] = current_time
+#                                 else:
+#                                     position['opened_at'] = existing_position['opened_at']  # Зберігаємо існуючий!
+#                                 if 'expires_at' not in existing_position or existing_position.get('expires_at', 0) <= 0:
+#                                     position['expires_at'] = position['opened_at'] + POSITION_MAX_AGE_SEC
+#                                 else:
+#                                     position['expires_at'] = existing_position['expires_at']  # Зберігаємо існуючий!
+#                                 position['xt_pair_url'] = generate_xt_pair_url(symbol)
+                                
+#                                 with active_positions_lock:
+#                                     active_positions[symbol] = position
+                                
+#                                 # Зберігаємо оновлені позиції
+#                                 save_positions_to_file()
+                                
+#                                 # 📱 ВІДПРАВЛЯЄМО ПРОФЕСІЙНЕ ПОВІДОМЛЕННЯ ПРО ВІДКРИТТЯ ПОЗИЦІЇ
+#                                 try:
+#                                     from telegram_formatter import format_position_opened_message
+#                                     opened_message = format_position_opened_message(
+#                                         symbol=symbol,
+#                                         side=side,
+#                                         entry_price=ref_price,
+#                                         size_usd=ORDER_AMOUNT,
+#                                         leverage=LEVERAGE,
+#                                         spread_percent=spread_pct
+#                                     )
+#                                     send_to_admins_and_group(opened_message)
+#                                     logging.info(f"📱 Відправлено Telegram про відкриття {symbol}")
+#                                 except Exception as e:
+#                                     logging.error(f"❌ Помилка відправки Telegram: {e}")
+                                
+#                                 logging.info("Opened %s on %s avg_entry=%.6f tp=%.6f", side, symbol, ref_price, tp_price)
+                    
+#                     elif has_position and AVERAGING_ENABLED:
+#                         # 🔒 УСЕРЕДНЕННЯ: Отримуємо позицію з захистом
+#                         with active_positions_lock:
+#                             position = active_positions[symbol].copy()  # Копіюємо для уникнення змін під час роботи
+#                         current_time = time.time()
+#                         cooldown_passed = (current_time - position.get('last_add_time', 0)) >= AVERAGING_COOLDOWN_SEC
+#                         can_add_more = position.get('adds_done', 0) < AVERAGING_MAX_ADDS
+                        
+#                         # 🔍 ДЕТАЛЬНЕ ЛОГУВАННЯ для діагностики
+#                         logging.info(f"[{symbol}] 🔍 УСЕРЕДНЕННЯ ДІАГНОСТИКА: adds_done={position.get('adds_done', 0)}, max_adds={AVERAGING_MAX_ADDS}, can_add_more={can_add_more}, cooldown_passed={cooldown_passed}")
+                        
+#                         # Перевірка ліміту позиції на символ
+#                         position_size_ok = position['size_usdt'] < MAX_POSITION_USDT_PER_SYMBOL
+                        
+#                         # 🎯 ЯВНА ПЕРЕВІРКА ВСІХ УМОВ для усереднення (як просив architect)
+#                         if AVERAGING_ENABLED and can_add_more and cooldown_passed and position_size_ok:
+#                             # Перевірка чи ціна йде проти позиції
+#                             avg_entry = position['avg_entry']
+#                             should_average = False
+                            
+#                             if position['side'] == "LONG" and side == "LONG":
+#                                 # LONG позиція: усереднюємо якщо ціна впала
+#                                 adverse_threshold = avg_entry * (1 - AVERAGING_THRESHOLD_PCT / 100)
+#                                 should_average = xt_price <= adverse_threshold
+#                             elif position['side'] == "SHORT" and side == "SHORT":
+#                                 # SHORT позиція: усереднюємо якщо ціна виросла
+#                                 adverse_threshold = avg_entry * (1 + AVERAGING_THRESHOLD_PCT / 100)
+#                                 should_average = xt_price >= adverse_threshold
+                            
+#                             if should_average:
+#                                 # 🎯 ЖОРСТКА ПЕРЕВІРКА ЛІМІТІВ: не перевищуємо MAX_POSITION_USDT_PER_SYMBOL
+#                                 remaining_capacity = MAX_POSITION_USDT_PER_SYMBOL - position['size_usdt']
+                                
+#                                 if remaining_capacity <= 0:
+#                                     logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ ЗАБЛОКОВАНО: позиція досягла максимуму ${MAX_POSITION_USDT_PER_SYMBOL:.2f}, поточний розмір=${position['size_usdt']:.2f}")
+#                                     continue  # Пропускаємо усереднення
+                                
+#                                 # 🛡️ ТОЧНИЙ РОЗРАХУНОК: використовуємо фіксований ORDER_AMOUNT, але перевіряємо ліміти
+#                                 if remaining_capacity < ORDER_AMOUNT:
+#                                     logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ СКАСОВАНО: недостатньо місця для ORDER_AMOUNT=${ORDER_AMOUNT:.2f}, залишок=${remaining_capacity:.2f}")
+#                                     continue
+#                                 if available_balance < ORDER_AMOUNT:
+#                                     logging.warning(f"[{symbol}] ❌ УСЕРЕДНЕННЯ СКАСОВАНО: недостатньо балансу для ORDER_AMOUNT=${ORDER_AMOUNT:.2f}, баланс=${available_balance:.2f}")
+#                                     continue
+                                
+#                                 # 🎯 ЗАВЖДИ ВИКОРИСТОВУЄМО ФІКСОВАНИЙ ORDER_AMOUNT для консистентності
+#                                 add_size = ORDER_AMOUNT
+                                
+#                                 logging.info(f"[{symbol}] 📈 УСЕРЕДНЕННЯ РОЗРАХУНОК: поточний_розмір=${position['size_usdt']:.2f}, макс=${MAX_POSITION_USDT_PER_SYMBOL:.2f}, залишок=${remaining_capacity:.2f}, додаємо=${add_size:.2f}")
+                                
+#                                 # УСЕРЕДНЕННЯ ТІЛЬКИ ЯКЩО Є ДОСТАТНЬО МІСЦЯ ТА БАЛАНСУ!
+#                                 if add_size >= 1.0:  # Мінімум $1.00 для ордера
+#                                     logging.info(f"[{symbol}] 📈 УСЕРЕДНЕННЯ: {position['side']} add_size=${add_size:.2f}, ціна={xt_price:.6f} vs avg={avg_entry:.6f}, спред={abs(spread_pct):.3f}%")
+                                    
+#                                     # Перевірка ліквідності для усереднення з правильної біржі
+#                                     ok_liq = can_execute_on_orderbook(symbol, add_size, ORDER_BOOK_DEPTH, exchange=trading_exchange)
+                                    
+#                                     # 🔍 ДОДАТКОВА ПЕРЕВІРКА XT order book для усереднення
+#                                     if ok_liq and trading_exchange == "xt":
+#                                         # ВИПРАВЛЕНО: використовуємо notional size для усереднення
+#                                         avg_notional_size = add_size * LEVERAGE
+#                                         can_avg_xt, xt_avg_info = analyze_xt_order_book_liquidity(xt, symbol, position['side'], avg_notional_size, min_liquidity_ratio=2.0)
+#                                         if not can_avg_xt:
+#                                             logging.warning(f"[{symbol}] УСЕРЕДНЕННЯ: {xt_avg_info}")
+#                                             ok_liq = False
+#                                         else:
+#                                             logging.info(f"[{symbol}] УСЕРЕДНЕННЯ: {xt_avg_info}")
+                                    
+#                                     if ok_liq:
+#                                         # ПРИМУСОВЕ встановлення левериджу ПЕРЕД усередненням
+#                                         if trading_exchange == "xt":
+#                                             try:
+#                                                 xt.set_leverage(LEVERAGE, symbol)
+#                                                 logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x для усереднення")
+#                                             except Exception as e:
+#                                                 logging.error(f"[{symbol}] ❌ Помилка левериджу XT при усередненні: {e}")
+#                                                 pass
+                                                
+#                                             # 🔒 ORDER PLACEMENT LOCK для усереднення (Task 6: запобігаємо конфліктним ордерам)
+#                                             with order_placement_lock:
+#                                                 order = xt_open_market_position(xt, symbol, position['side'], add_size, LEVERAGE, ref_price, dex_price, spread_pct)
+#                                             current_price = ref_price  # Завжди XT ціна
+#                                         else:
+#                                             order = None
+#                                             current_price = ref_price
+#                                         # ❌ GATE.IO ВІДКЛЮЧЕНО - тільки XT біржа!
+#                                         # else:  # gate (ВІДКЛЮЧЕНО)
+#                                         #     order = open_market_position(symbol, position['side'], add_size, LEVERAGE, gate_price, dex_price, spread_pct)
+#                                         if order:
+#                                             # 🔒 Оновлення агрегованої позиції з захистом
+#                                             with active_positions_lock:
+#                                                 if symbol in active_positions:  # Перевіряємо що позиція ще існує
+#                                                     current_position = active_positions[symbol]
+#                                                     new_size = current_position['size_usdt'] + add_size
+#                                                     new_avg_entry = (current_position['avg_entry'] * current_position['size_usdt'] + current_price * add_size) / new_size
+#                                                 else:
+#                                                     logging.warning(f"[{symbol}] Позиція не знайдена для усереднення")
+#                                                     continue
+#                                                     # ФІКСОВАНА ЦІЛЬ: +30% прибутку з левериджем (як просив користувач)
+#                                                     if current_position['side'] == "LONG":
+#                                                         new_tp_price = new_avg_entry * (1 + 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+#                                                     else:  # SHORT
+#                                                         new_tp_price = new_avg_entry * (1 - 0.30 / LEVERAGE)  # 30% прибутку з левериджем
+                                                    
+#                                                     active_positions[symbol].update({
+#                                                         'avg_entry': new_avg_entry,
+#                                                         'size_usdt': new_size,
+#                                                         'adds_done': current_position['adds_done'] + 1,
+#                                                         'last_add_price': ref_price,
+#                                                         'tp_price': new_tp_price,
+#                                                         'last_add_time': current_time
+#                                                     })
+                                                    
+#                                                     # 🔍 ДЕТАЛЬНЕ ЛОГУВАННЯ оновлення позиції  
+#                                                     logging.info(f"✅ ПОЗИЦІЯ ОНОВЛЕНА: adds_done {current_position['adds_done']} -> {current_position['adds_done'] + 1}, розмір ${current_position['size_usdt']:.2f} -> ${new_size:.2f}")
+                                            
+#                                             # 🔍 ВИПРАВЛЕНО: використовуємо оновлене значення adds_done
+#                                             updated_adds = current_position['adds_done'] + 1
+#                                             logging.info(f"✅ УСЕРЕДНЕННЯ ЗАВЕРШЕНО {position['side']} на {symbol}: нова avg_entry={new_avg_entry:.6f}, розмір=${new_size:.2f}, додавань={updated_adds}/{AVERAGING_MAX_ADDS}")
+#                 else:
+#                     if not spread_check:
+#                         logging.debug(f"[{symbol}] Спред {abs(spread_pct):.3f}% < {MIN_SPREAD}%")
+#                     elif not positions_check and not has_position:
+#                         logging.info(f"[{symbol}] ❌ Занадто багато позицій: {total_positions} >= {MAX_OPEN_POSITIONS}")
+#                     elif not balance_check:
+#                         logging.info(f"[{symbol}] ❌ Недостатньо балансу: потрібно {required_margin:.4f} USDT, є {available_balance:.4f} USDT")
+#             except Exception as balance_error:
+#                 logging.exception("Balance check error with full traceback")
+
+#             # 4) 🔒 АВТОМАТИЧНЕ ЗАКРИТТЯ ПРИ СПРЕДІ 30% З ЗАХИСТОМ
+#             with active_positions_lock:
+#                 if symbol in active_positions:
+#                     position = active_positions[symbol].copy()  # Копіюємо для роботи поза локом
+#                 else:
+#                     position = None
+            
+#             if position:
+                
+#                 # ✅ НОВІ УМОВИ ВИХОДУ (як просив користувач):
+#                 # 1) Основна ціль: +30% прибутку
+#                 # 2) При зникненні спреду: дострокове закриття на +10-15%
+                
+#                 current_price = ref_price  # Завжди XT ціна
+#                 entry_price = position['avg_entry']
+                
+#                 # Розрахунок поточного P&L у відсотках
+#                 if position['side'] == "LONG":
+#                     pnl_pct = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
+#                 else:  # SHORT  
+#                     pnl_pct = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
+                
+#                 should_close = False
+#                 close_reason = ""
+                
+#                 # 1) ОСНОВНА ЦІЛЬ: +30% прибутку (примусове закриття)
+#                 if pnl_pct >= 30.0:
+#                     should_close = True
+#                     close_reason = f"🎯 ДОСЯГНУТО ЦІЛЬ +30%! P&L={pnl_pct:.1f}%"
+                    
+#                 # 2) ДОСТРОКОВЕ ЗАКРИТТЯ: спред зникає + прибуток 10-15%
+#                 elif abs(spread_pct) < 0.3 and 10.0 <= pnl_pct < 30.0:  # спред < 0.3% вважається "зниклим"
+#                     should_close = True
+#                     close_reason = f"⚡ ДОСТРОКОВЕ ЗАКРИТТЯ: спред зник ({abs(spread_pct):.2f}% < 0.3%) + прибуток {pnl_pct:.1f}% (в межах 10-30%)"
+                    
+#                 # 3) ЗАХИСТ: спред > 30% (як було раніше)
+#                 elif abs(spread_pct) >= 30.0:
+#                     should_close = True 
+#                     close_reason = f"🚨 АВАРІЙНЕ ЗАКРИТТЯ: спред {abs(spread_pct):.2f}% >= 30%"
+                
+#                 if should_close:
+#                     logging.warning(f"🚨 АВТОЗАКРИТТЯ {position['side']} {symbol}: {close_reason}")
+                    
+#                     # БЕЗПЕЧНЕ ЗАКРИТТЯ: спочатку закриваємо на біржі, потім видаляємо з системи
+#                     try:
+#                         # Отримуємо свіжу ціну для точного закриття
+#                         fresh_ticker = fetch_ticker(xt, symbol)
+#                         if fresh_ticker:
+#                             current_xt_price = float(fresh_ticker['last'])
+#                         else:
+#                             current_xt_price = ref_price  # fallback
+                        
+#                         # ПЕРЕВІРЯЄМО ЧИ ІСНУЄ ПОЗИЦІЯ ПЕРЕД ЗАКРИТТЯМ
+#                         # Отримуємо свіжі позиції з біржі
+#                         try:
+#                             # 🔧 ВИКОРИСТОВУЄМО БЕЗПЕЧНИЙ WRAPPER
+#                             # Gate.io відключено - використовуємо тільки XT  
+#                             # Gate.io відключено - використовуємо тільки XT positions
+#                             current_positions = []
+#                             has_real_position = False
+#                             for pos in current_positions:
+#                                 if pos['symbol'] == symbol and float(pos.get('contracts', 0)) > 0:
+#                                     has_real_position = True
+#                                     break
+                            
+#                             if not has_real_position:
+#                                 logging.warning(f"🚨 ПОЗИЦІЯ {symbol} УЖЕ ЗАКРИТА НА БІРЖІ - видаляємо з системи")
+#                                 with active_positions_lock:
+#                                     if symbol in active_positions:
+#                                         del active_positions[symbol]
+#                                 continue
+#                         except:
+#                             logging.warning(f"⚠️ Не вдалося перевірити позиції - пробуємо закрити")
+                        
+#                         # Пробуємо закрити позицію на біржі
+#                         close_success = close_position_market(symbol, position['side'], position['size_usdt'])
+                        
+#                         if close_success:
+#                             # 🔒 ТІЛЬКИ якщо закриття успішне - видаляємо з системи
+#                             with active_positions_lock:
+#                                 if symbol in active_positions:
+#                                     del active_positions[symbol]
+                            
+#                             # ДОДАЄМО ДО ІСТОРІЇ ТОРГІВЛІ
+#                             try:
+#                                 import telegram_admin
+#                                 telegram_admin.add_to_trade_history(
+#                                     symbol=symbol,
+#                                     side=position['side'],
+#                                     entry_price=position['avg_entry'],
+#                                     close_price=current_xt_price,
+#                                     pnl=(position['size_usdt'] * pnl_pct / 100),
+#                                     close_reason=close_reason,
+#                                     exchange="Gate.io"
+#                                 )
+#                                 logging.info(f"📚 Додано до історії: {symbol} P&L={pnl_pct:+.1f}%")
+#                             except Exception as history_error:
+#                                 logging.error(f"❌ Помилка додавання до історії: {history_error}")
+                            
+#                             # Визначаємо емодзі результату
+#                             if pnl_pct > 0:
+#                                 result_emoji = "💚"
+#                                 result_text = f"+${(position['size_usdt'] * pnl_pct / 100):+.2f}"
+#                             elif pnl_pct < 0:
+#                                 result_emoji = "❤️"
+#                                 result_text = f"${(position['size_usdt'] * pnl_pct / 100):+.2f}"
+#                             else:
+#                                 result_emoji = "💙"
+#                                 result_text = "$0.00"
+                            
+#                             # 🎯 РОЗШИРЕНЕ ДЕТАЛЬНЕ СПОВІЩЕННЯ ПРО АВТОЗАКРИТТЯ (як просив користувач!)
+#                             close_signal = f"🎯 **АВТОЗАКРИТТЯ ПОЗИЦІЇ** {result_emoji}\n"\
+#                                          f"📊 **{symbol.replace('/USDT:USDT', '')}** ({position['side']}) | ⚡ XT.COM\n"\
+#                                          f"💰 Розмір: **${position['size_usdt']:.2f} USDT** | Леверидж: **{LEVERAGE}x**\n"\
+#                                          f"📈 Вхід: **${position['avg_entry']:.6f}**\n"\
+#                                          f"📉 Вихід: **${current_xt_price:.6f}**\n"\
+#                                          f"💎 P&L: **{pnl_pct:+.1f}%** ({result_text})\n"\
+#                                          f"📊 Спред: **{abs(spread_pct):.2f}%**\n"\
+#                                          f"🎯 Причина: **{close_reason}**\n"\
+#                                          f"⏰ Час: {datetime.now().strftime('%H:%M:%S')}\n"\
+#                                          f"✅ Статус: **УСПІШНО ЗАКРИТО** | #ArbitrageBot"
+                            
+#                             # 📊 ПОЗИЦІЇ ОБОМ АДМІНАМ + ГРУПІ
+#                             send_to_admins_and_group(close_signal)
+#                             logging.info(f"✅ АВТОЗАКРИТО {position['side']} {symbol}: спред={abs(spread_pct):.2f}%, розмір=${position['size_usdt']:.2f}")
+#                             continue  # Пропускаємо перевірку TP
+#                         else:
+#                             # 🔥 КРИТИЧНЕ ВИПРАВЛЕННЯ: НЕ відправляємо Telegram для нормальних помилок автозакриття
+#                             logging.info(f"⚠️ Автозакриття {position['side']} {symbol} не вдалося - це може бути нормально (позиція вже закрита)")
+#                             # Позиція залишається в active_positions для подальшого управління
+                            
+#                     except Exception as close_error:
+#                         # 🔥 КРИТИЧНЕ ВИПРАВЛЕННЯ: Використовуємо ту саму логіку фільтрації як у close_position_market
+#                         error_str = str(close_error).lower()
+#                         normal_errors = [
+#                             "reduce_exceeded", "empty position", "position not found",
+#                             "insufficient margin", "position already closed", "order not found",
+#                             "rate limit", "timeout", "connection", "network"
+#                         ]
+#                         is_normal_error = any(err in error_str for err in normal_errors)
+                        
+#                         if is_normal_error:
+#                             logging.info(f"⚠️ Нормальна помилка автозакриття {symbol}: {error_str[:50]}... (без сповіщення)")
+#                         else:
+#                             logging.error(f"❌ КРИТИЧНА ПОМИЛКА при автозакритті {symbol}: {close_error}")
+#                             # ТІЛЬКИ для справді критичних помилок відправляємо в Telegram
+#                             error_signal = f"🚨 **КРИТИЧНА СИСТЕМНА ПОМИЛКА!**\n"\
+#                                          f"📊 Символ: **{symbol.replace('/USDT:USDT', '')}** ({position['side']})\n"\
+#                                          f"💰 Розмір позиції: **${position['size_usdt']:.2f}**\n"\
+#                                          f"📈 Вхід: **${position['avg_entry']:.6f}**\n"\
+#                                          f"📉 Поточна ціна: **${ref_price:.6f}**\n"\
+#                                          f"📊 P&L: **{pnl_pct:+.1f}%**\n"\
+#                                          f"⚠️ Спред: **{abs(spread_pct):.2f}%**\n"\
+#                                          f"🎯 Причина: {close_reason}\n"\
+#                                          f"❌ **ПОМИЛКА API**: `{str(close_error)[:100]}...`\n"\
+#                                          f"🏪 Біржа: **{position.get('exchange', 'gate').upper()}**\n"\
+#                                          f"⏰ Час: **{time.strftime('%H:%M:%S %d.%m.%Y')}**\n"\
+#                                          f"🚨 **ТЕРМІНОВО ПОТРІБНЕ РУЧНЕ ВТРУЧАННЯ!**"
+#                             # 🚨 КРИТИЧНІ ПОМИЛКИ ОБОМ АДМІНАМ + ГРУПІ
+#                             send_to_admins_and_group(error_signal)
+#                         # Позиція залишається в системі для подальшого управління
+                
+#                 # ВИДАЛЕНО: стара логіка 25% TP - замінена на нову логіку 30% вище
+
+#         except Exception as e:
+#             # ДЕТАЛЬНЕ ЛОГУВАННЯ ГЛОБАЛЬНИХ ПОМИЛОК ВОРКЕРА
+#             error_msg = f"⚠️ **ПОМИЛКА ВОРКЕРА СИМВОЛУ**\n"\
+#                        f"📊 Символ: **{symbol.replace('/USDT:USDT', '')}**\n"\
+#                        f"❌ Помилка: `{str(e)[:150]}...`\n"\
+#                        f"🔧 Воркер продовжує роботу через 30 сек\n"\
+#                        f"⏰ Час: **{time.strftime('%H:%M:%S')}**"
+#             # Відправляємо тільки у випадку серйозних помилок (не часті дрібниці)  
+#             if "timeout" not in str(e).lower() and "rate limit" not in str(e).lower():
+#                 # 🚨 ПОМИЛКИ ВОРКЕРА ОБОМ АДМІНАМ + ГРУПІ
+#                 send_to_admins_and_group(error_msg)
+#             logging.error("Symbol worker error %s %s", symbol, e)
+
+#         # невелика пауза
+#         time.sleep(SCAN_INTERVAL)
 
 def send_balance_monitoring_thread():
     """Окремий потік для періодичного моніторингу балансу"""
@@ -2219,7 +3034,7 @@ def close_position_by_contracts(exchange, symbol, contracts, side):
         raise
 
 def start_workers():
-    global _plot_thread
+    global _plot_thread, worker_threads # ⬅️ ЗМІНЕНО: переконуємося, що worker_threads глобальний
     logging.info("🚨 DEBUG: start_workers() ВИКЛИКАЄТЬСЯ!")
     
     # 🎯 КРИТИЧНО: Запускаємо моніторинг ПЕРШИМ (до всіх інших ініціалізацій)
@@ -2259,31 +3074,137 @@ def start_workers():
     _plot_thread.start()
 
     # 🚀 ВИПРАВЛЕНО: Батч-обробка ВСІХ 733 пар по 50 паралельно
-    # Замість обмеження активних потоків, розбиваємо на батчі
-    symbols = list(markets.keys())
-    batch_size = MAX_CONCURRENT_SYMBOLS
-    total_symbols = len(symbols)
+    # ⬅️ ЗМІНЕНО: Додано головний цикл while bot_running:
+    while bot_running:
+        try:
+            symbols = list(markets.keys())
+            batch_size = MAX_CONCURRENT_SYMBOLS
+            total_symbols = len(symbols)
+            
+            logging.info(f"🔄 РОЗПОЧИНАЄМО НОВИЙ ЦИКЛ СКАНУВАННЯ: {total_symbols} символів, батчами по {batch_size}")
+            
+            # 🧹 Очищаємо глобальний список воркерів перед новим циклом
+            worker_threads = [] 
+            
+            # Розбиваємо символи на батчі
+            for batch_start in range(0, total_symbols, batch_size):
+                if not bot_running: # ⬅️ ДОДАНО: Перевірка зупинки між батчами
+                    logging.info("🔴 Отримано сигнал зупинки, перериваємо цикл сканування.")
+                    break
+                    
+                batch_end = min(batch_start + batch_size, total_symbols)
+                batch_symbols = symbols[batch_start:batch_end]
+                
+                logging.info(f"📦 Батч {batch_start//batch_size + 1}: запускаємо {len(batch_symbols)} символів (від {batch_start} до {batch_end-1})")
+                
+                current_batch_threads = [] # ⬅️ ДОДАНО: Локальний список для очікування
+                
+                # Запускаємо всі символи з поточного батчу
+                for sym in batch_symbols:
+                    if not bot_running: break # ⬅️ ДОДАНО: Перевірка зупинки під час запуску
+                    t = threading.Thread(target=symbol_worker, args=(sym,), daemon=True)
+                    t.start()
+                    worker_threads.append(t) # ⬅️ ДОДАНО: Для функції stop_all_workers
+                    current_batch_threads.append(t) # ⬅️ ДОДАНО: Для .join()
+                    # ⛔️ ВИДАЛЕНО: time.sleep(1) (це занадто повільно для запуску батчу)
+                
+                # ⏳ ЧЕКАЄМО ЗАВЕРШЕННЯ ПОТОЧНОГО БАТЧУ 
+                logging.info(f"⏳ Очікуємо завершення {len(current_batch_threads)} воркерів з батчу...")
+                for t in current_batch_threads:
+                    if not bot_running: break # ⬅️ ДОДАНО: Можна перервати очікування
+                    t.join() # ⬅️ ДОДАНО: Чекаємо, поки воркер завершить 1 прохід
+                
+                if not bot_running: break # ⬅️ ДОДАНО: Вихід з циклу батчів
+                
+                logging.info(f"✅ Батч {batch_start//batch_size + 1} завершено.")
+
+                # Чекаємо трохи між батчами для розподілу навантаження
+                if batch_end < total_symbols and bot_running:
+                    logging.info(f"⏸️  Пауза 5 секунди між батчами...")
+                    monitor_stop_event.wait(timeout=5) # ⬅️ ЗМІНЕНО: Використовуємо .wait() для швидкої зупинки
+            
+            if not bot_running:
+                logging.info("🔴 Цикл сканування зупинено.")
+                break # Вихід з головного циклу while
+
+            logging.info(f"✅✅✅ УСІ БАТЧІ ЗАВЕРШЕНО. Повний цикл сканування завершено.")
+            logging.info(f"🔄 Пауза 30 секунд перед початком нового циклу сканування...")
+            
+            # ⬅️ ДОДАНО: Пауза 60 секунд перед новим повним скануванням
+            monitor_stop_event.wait(timeout=30) 
+
+        except Exception as e:
+            logging.error(f"❌ КРИТИЧНА ПОМИЛКА в головному циклі start_workers: {e}")
+            logging.info("Пауза 30 секунд після помилки...")
+            if bot_running:
+                monitor_stop_event.wait(timeout=30) # ⬅️ ЗМІНЕНО: Пауза на випадок помилки
+
+
+# def start_workers():
+#     global _plot_thread
+#     logging.info("🚨 DEBUG: start_workers() ВИКЛИКАЄТЬСЯ!")
     
-    logging.info(f"🚀 Запускаємо {total_symbols} символів батчами по {batch_size}")
+#     # 🎯 КРИТИЧНО: Запускаємо моніторинг ПЕРШИМ (до всіх інших ініціалізацій)
+#     try:
+#         logging.info("🚨 DEBUG: ПРІОРИТЕТ 1 - Запуск моніторингу позицій...")
+#         logging.info("🎯 СТАРТ: Готуюся запустити моніторинг позицій...")
+#         start_position_monitoring_thread()
+#         logging.info("🎯 СТАРТ: Моніторинг позицій запущений успішно!")
+#     except Exception as e:
+#         logging.error(f"🚨 DEBUG: ПОМИЛКА в start_position_monitoring_thread(): {e}")
+#         # Не raise - продовжуємо навіть якщо моніторинг не запустився
     
-    # Розбиваємо символи на батчі
-    for batch_start in range(0, total_symbols, batch_size):
-        batch_end = min(batch_start + batch_size, total_symbols)
-        batch_symbols = symbols[batch_start:batch_end]
+#     try:
+#         logging.info("🚨 DEBUG: Початок init_markets()...")
+#         init_markets()
+#         logging.info("🚨 DEBUG: init_markets() завершено!")
+#     except Exception as e:
+#         logging.error(f"🚨 DEBUG: ПОМИЛКА в init_markets(): {e}")
+#         raise
+    
+#     try:
+#         logging.info("🚨 DEBUG: Початок send_balance_monitoring_thread()...")
+#         # Запуск моніторингу балансу
+#         send_balance_monitoring_thread()
+#         logging.info("🚨 DEBUG: send_balance_monitoring_thread() завершено!")
+#     except Exception as e:
+#         logging.error(f"🚨 DEBUG: ПОМИЛКА в send_balance_monitoring_thread(): {e}")
+#         raise
+    
+#     # 🎯 ЗАПУСК: Нова система найкращих сигналів (замість багатьох)
+#     best_signal_thread = threading.Thread(target=send_best_opportunity_signal, daemon=True)
+#     best_signal_thread.start()
+#     logging.info("🏆 СТАРТ: Система ОДНОГО найкращого сигналу запущена!")
+    
+#     # старт plot треда
+#     _plot_thread = threading.Thread(target=plot_spread_live, args=(spread_store,), daemon=True)
+#     _plot_thread.start()
+
+#     # 🚀 ВИПРАВЛЕНО: Батч-обробка ВСІХ 733 пар по 50 паралельно
+#     # Замість обмеження активних потоків, розбиваємо на батчі
+#     symbols = list(markets.keys())
+#     batch_size = MAX_CONCURRENT_SYMBOLS
+#     total_symbols = len(symbols)
+    
+#     logging.info(f"🚀 Запускаємо {total_symbols} символів батчами по {batch_size}")
+    
+#     # Розбиваємо символи на батчі
+#     for batch_start in range(0, total_symbols, batch_size):
+#         batch_end = min(batch_start + batch_size, total_symbols)
+#         batch_symbols = symbols[batch_start:batch_end]
         
-        logging.info(f"📦 Батч {batch_start//batch_size + 1}: запускаємо {len(batch_symbols)} символів (від {batch_start} до {batch_end-1})")
+#         logging.info(f"📦 Батч {batch_start//batch_size + 1}: запускаємо {len(batch_symbols)} символів (від {batch_start} до {batch_end-1})")
         
-        # Запускаємо всі символи з поточного батчу
-        for sym in batch_symbols:
-            t = threading.Thread(target=symbol_worker, args=(sym,), daemon=True)
-            t.start()
-            worker_threads.append(t)
-            time.sleep(0.02)  # Невелика затримка між запусками
-        
-        # Чекаємо трохи між батчами для розподілу навантаження
-        if batch_end < total_symbols:
-            logging.info(f"⏸️  Пауза 2 секунди між батчами...")
-            time.sleep(2)
+#         # Запускаємо всі символи з поточного батчу
+#         for sym in batch_symbols:
+#             t = threading.Thread(target=symbol_worker, args=(sym,), daemon=True)
+#             t.start()
+#             worker_threads.append(t)
+#             time.sleep(1)  # Невелика затримка між запусками
+#         # Чекаємо трохи між батчами для розподілу навантаження
+#         if batch_end < total_symbols:
+#             logging.info(f"⏸️  Пауза 10 секунди між батчами...")
+#             time.sleep(10)
 
 if __name__ == "__main__":
     test_telegram_configuration()  # Тестуємо Telegram перед стартом

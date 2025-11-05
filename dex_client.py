@@ -352,12 +352,6 @@ class DexCheckClient:
         return True
     
     def _try_coingecko(self, symbol: str) -> Optional[Dict]:
-        """
-        🚀 CoinGecko API - безкоштовний, надійний провайдер даних
-        Використовує CoinGecko token IDs для отримання актуальних цін
-        З exponential backoff для захисту від rate limit
-        """
-        # Mapping символів на CoinGecko token IDs
         symbol_to_coingecko = {
             'BTC': 'bitcoin',
             'ETH': 'ethereum', 
@@ -447,7 +441,15 @@ class DexCheckClient:
             'SYN': 'synapse-2',
             'TRIBE': 'tribe-2',
             'UNFI': 'unifi-protocol-dao',
-            'YGG': 'yield-guild-games'
+            'YGG': 'yield-guild-games',
+            'IMX': 'immutable-x',
+            'LDO': 'lido-dao',
+            # ВАШЕ ВИПРАВЛЕННЯ ТУТ
+            'KAIA': 'kaia-coin', 
+            'BAN': 'banano',
+            'ORCA': 'orca', 
+            'MOVE': 'move-to-earn',
+            'GOAT': 'goat-coin',
         }
         
         coingecko_id = symbol_to_coingecko.get(symbol.upper())
