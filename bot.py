@@ -808,12 +808,17 @@ def monitor_open_positions():
                 
                 if result:
                     # Успішне закриття - видаляємо з активних позицій 🔒 THREAD SAFE
+                    position_closed = False # <-- Створюємо флаг
                     with active_positions_lock:
                         if symbol in active_positions:
                             del active_positions[symbol]
                             logging.info(f"🗑️ {symbol}: Видалено з active_positions")
-                            # Зберігаємо оновлені позиції після закриття
-                            save_positions_to_file()
+                            position_closed = True # <-- Встановлюємо флаг
+                            # ⛔️ Виклик save_positions_to_file() ПРИБРАНО ЗВІДСИ
+                    
+                    # Зберігаємо оновлені позиції ПІСЛЯ звільнення локу
+                    if position_closed:
+                        save_positions_to_file() # <--- ПЕРЕМІЩЕНО СЮДИ
                     
                     # ✅ ВІДПРАВЛЯЄМО ПОВІДОМЛЕННЯ ПРО ЗАКРИТТЯ ПОЗИЦІЇ
                     close_signal = f"✅ **ПОЗИЦІЮ ЗАКРИТО!**\n"\
@@ -3014,24 +3019,130 @@ def start_monitor():
         
         return monitor_thread
 
-def close_position_by_contracts(exchange, symbol, contracts, side):
-    """Закриває позицію за кількістю контрактів (НЕ USD!)"""
-    if DRY_RUN:
-        logging.info(f"DRY RUN: закрити {contracts} контрактів {symbol} {side}")
-        return
+# def close_position_by_contracts(exchange, symbol, contracts, side):
+#     """Закриває позицію за кількістю контрактів (НЕ USD!)"""
+#     if DRY_RUN:
+#         logging.info(f"DRY RUN: закрити {contracts} контрактів {symbol} {side}")
+#         return
     
-    try:
-        # Визначаємо протилежну сторону
-        opposite_side = 'sell' if side.upper() == 'LONG' else 'buy'
+#     try:
+#         # Визначаємо протилежну сторону
+#         opposite_side = 'sell' if side.upper() == 'LONG' else 'buy'
         
-        # Розміщуємо ринковий ордер на закриття
-        order = exchange.create_market_order(symbol, opposite_side, contracts)
-        logging.info(f"✅ Закрито позицію: {symbol} {contracts} контрактів ({opposite_side})")
-        return order
+#         # Розміщуємо ринковий ордер на закриття
+#         order = exchange.create_market_order(symbol, opposite_side, contracts)
+#         logging.info(f"✅ Закрито позицію: {symbol} {contracts} контрактів ({opposite_side})")
+#         return order
         
-    except Exception as e:
-        logging.error(f"❌ Помилка закриття позиції {symbol}: {e}")
-        raise
+#     except Exception as e:
+#         logging.error(f"❌ Помилка закриття позиції {symbol}: {e}")
+#         raise
+
+# def start_workers():
+#     global _plot_thread, worker_threads # ⬅️ ЗМІНЕНО: переконуємося, що worker_threads глобальний
+#     logging.info("🚨 DEBUG: start_workers() ВИКЛИКАЄТЬСЯ!")
+    
+#     # 🎯 КРИТИЧНО: Запускаємо моніторинг ПЕРШИМ (до всіх інших ініціалізацій)
+#     try:
+#         logging.info("🚨 DEBUG: ПРІОРИТЕТ 1 - Запуск моніторингу позицій...")
+#         logging.info("🎯 СТАРТ: Готуюся запустити моніторинг позицій...")
+#         start_position_monitoring_thread()
+#         logging.info("🎯 СТАРТ: Моніторинг позицій запущений успішно!")
+#     except Exception as e:
+#         logging.error(f"🚨 DEBUG: ПОМИЛКА в start_position_monitoring_thread(): {e}")
+#         # Не raise - продовжуємо навіть якщо моніторинг не запустився
+    
+#     try:
+#         logging.info("🚨 DEBUG: Початок init_markets()...")
+#         init_markets()
+#         logging.info("🚨 DEBUG: init_markets() завершено!")
+#     except Exception as e:
+#         logging.error(f"🚨 DEBUG: ПОМИЛКА в init_markets(): {e}")
+#         raise
+    
+#     try:
+#         logging.info("🚨 DEBUG: Початок send_balance_monitoring_thread()...")
+#         # Запуск моніторингу балансу
+#         send_balance_monitoring_thread()
+#         logging.info("🚨 DEBUG: send_balance_monitoring_thread() завершено!")
+#     except Exception as e:
+#         logging.error(f"🚨 DEBUG: ПОМИЛКА в send_balance_monitoring_thread(): {e}")
+#         raise
+    
+#     # 🎯 ЗАПУСК: Нова система найкращих сигналів (замість багатьох)
+#     best_signal_thread = threading.Thread(target=send_best_opportunity_signal, daemon=True)
+#     best_signal_thread.start()
+#     logging.info("🏆 СТАРТ: Система ОДНОГО найкращого сигналу запущена!")
+    
+#     # старт plot треда
+#     _plot_thread = threading.Thread(target=plot_spread_live, args=(spread_store,), daemon=True)
+#     _plot_thread.start()
+
+#     # 🚀 ВИПРАВЛЕНО: Батч-обробка ВСІХ 733 пар по 50 паралельно
+#     # ⬅️ ЗМІНЕНО: Додано головний цикл while bot_running:
+#     while bot_running:
+#         try:
+#             symbols = list(markets.keys())
+#             batch_size = MAX_CONCURRENT_SYMBOLS
+#             total_symbols = len(symbols)
+            
+#             logging.info(f"🔄 РОЗПОЧИНАЄМО НОВИЙ ЦИКЛ СКАНУВАННЯ: {total_symbols} символів, батчами по {batch_size}")
+            
+#             # 🧹 Очищаємо глобальний список воркерів перед новим циклом
+#             worker_threads = [] 
+            
+#             # Розбиваємо символи на батчі
+#             for batch_start in range(0, total_symbols, batch_size):
+#                 if not bot_running: # ⬅️ ДОДАНО: Перевірка зупинки між батчами
+#                     logging.info("🔴 Отримано сигнал зупинки, перериваємо цикл сканування.")
+#                     break
+                    
+#                 batch_end = min(batch_start + batch_size, total_symbols)
+#                 batch_symbols = symbols[batch_start:batch_end]
+                
+#                 logging.info(f"📦 Батч {batch_start//batch_size + 1}: запускаємо {len(batch_symbols)} символів (від {batch_start} до {batch_end-1})")
+                
+#                 current_batch_threads = [] # ⬅️ ДОДАНО: Локальний список для очікування
+                
+#                 # Запускаємо всі символи з поточного батчу
+#                 for sym in batch_symbols:
+#                     if not bot_running: break # ⬅️ ДОДАНО: Перевірка зупинки під час запуску
+#                     t = threading.Thread(target=symbol_worker, args=(sym,), daemon=True)
+#                     t.start()
+#                     worker_threads.append(t) # ⬅️ ДОДАНО: Для функції stop_all_workers
+#                     current_batch_threads.append(t) # ⬅️ ДОДАНО: Для .join()
+#                     # ⛔️ ВИДАЛЕНО: time.sleep(1) (це занадто повільно для запуску батчу)
+                
+#                 # ⏳ ЧЕКАЄМО ЗАВЕРШЕННЯ ПОТОЧНОГО БАТЧУ 
+#                 logging.info(f"⏳ Очікуємо завершення {len(current_batch_threads)} воркерів з батчу...")
+#                 for t in current_batch_threads:
+#                     if not bot_running: break # ⬅️ ДОДАНО: Можна перервати очікування
+#                     t.join() # ⬅️ ДОДАНО: Чекаємо, поки воркер завершить 1 прохід
+                
+#                 if not bot_running: break # ⬅️ ДОДАНО: Вихід з циклу батчів
+                
+#                 logging.info(f"✅ Батч {batch_start//batch_size + 1} завершено.")
+
+#                 # Чекаємо трохи між батчами для розподілу навантаження
+#                 if batch_end < total_symbols and bot_running:
+#                     logging.info(f"⏸️  Пауза 5 секунди між батчами...")
+#                     monitor_stop_event.wait(timeout=5) # ⬅️ ЗМІНЕНО: Використовуємо .wait() для швидкої зупинки
+            
+#             if not bot_running:
+#                 logging.info("🔴 Цикл сканування зупинено.")
+#                 break # Вихід з головного циклу while
+
+#             logging.info(f"✅✅✅ УСІ БАТЧІ ЗАВЕРШЕНО. Повний цикл сканування завершено.")
+#             logging.info(f"🔄 Пауза 30 секунд перед початком нового циклу сканування...")
+            
+#             # ⬅️ ДОДАНО: Пауза 60 секунд перед новим повним скануванням
+#             monitor_stop_event.wait(timeout=30) 
+
+#         except Exception as e:
+#             logging.error(f"❌ КРИТИЧНА ПОМИЛКА в головному циклі start_workers: {e}")
+#             logging.info("Пауза 30 секунд після помилки...")
+#             if bot_running:
+#                 monitor_stop_event.wait(timeout=30) # ⬅️ ЗМІНЕНО: Пауза на випадок помилки
 
 def start_workers():
     global _plot_thread, worker_threads # ⬅️ ЗМІНЕНО: переконуємося, що worker_threads глобальний
@@ -3112,7 +3223,8 @@ def start_workers():
                 logging.info(f"⏳ Очікуємо завершення {len(current_batch_threads)} воркерів з батчу...")
                 for t in current_batch_threads:
                     if not bot_running: break # ⬅️ ДОДАНО: Можна перервати очікування
-                    t.join() # ⬅️ ДОДАНО: Чекаємо, поки воркер завершить 1 прохід
+                    
+                    t.join(timeout=60.0) # ⬅️ НОВИЙ КОД: Чекаємо максимум 60 секунд
                 
                 if not bot_running: break # ⬅️ ДОДАНО: Вихід з циклу батчів
                 
@@ -3130,7 +3242,7 @@ def start_workers():
             logging.info(f"✅✅✅ УСІ БАТЧІ ЗАВЕРШЕНО. Повний цикл сканування завершено.")
             logging.info(f"🔄 Пауза 30 секунд перед початком нового циклу сканування...")
             
-            # ⬅️ ДОДАНО: Пауза 60 секунд перед новим повним скануванням
+            # ⬅️ ДОДАНО: Пауза 30 секунд перед новим повним скануванням
             monitor_stop_event.wait(timeout=30) 
 
         except Exception as e:
@@ -3138,7 +3250,6 @@ def start_workers():
             logging.info("Пауза 30 секунд після помилки...")
             if bot_running:
                 monitor_stop_event.wait(timeout=30) # ⬅️ ЗМІНЕНО: Пауза на випадок помилки
-
 
 # def start_workers():
 #     global _plot_thread

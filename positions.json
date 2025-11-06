@@ -1,24 +1,5 @@
 {
-  "positions": {
-    "ZK/USDT:USDT": {
-      "side": "LONG",
-      "avg_entry": 0.0777,
-      "size_usdt": 5.0,
-      "adds_done": 0,
-      "last_add_price": 0.0777,
-      "tp_price": 0.08103,
-      "last_add_time": 1762354339.6385238,
-      "exchange": "xt",
-      "entry_time": 1762354339.638524,
-      "arb_pair": "xt-dex",
-      "entry_spread_pct": 2.2533014835302922,
-      "entry_ref_price": 0.07954,
-      "status": "open",
-      "opened_at": 1762354339.6385274,
-      "expires_at": 1762357939.6385274,
-      "xt_pair_url": "https://www.xt.com/en/trade/futures_ZKUSDT"
-    }
-  },
-  "saved_at": 1762354339.6385396,
+  "positions": {},
+  "saved_at": 1762438001.9153001,
   "version": "1.1"
 }
