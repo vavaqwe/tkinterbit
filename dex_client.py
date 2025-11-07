@@ -177,7 +177,8 @@ class DexCheckClient:
         Найбільш надійні та актуальні ціни з DexScreener!
         """
         try:
-            clean_symbol = symbol.replace('/USDT:USDT', '').replace('/USDT', '').upper()
+            clean_symbol = symbol.split('/')[0].split(':')[0].upper()
+            # clean_symbol = symbol.replace('/USDT:USDT', '').replace('/USDT', '').upper()
             
             # 1. Перевіряємо кеш (окремий для конвергенції)
             cache_key = f"{clean_symbol}_best_pair{'_convergence' if for_convergence else ''}"
