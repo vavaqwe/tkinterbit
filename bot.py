@@ -72,6 +72,70 @@ best_opportunities = {}  # {symbol: {spread, side, score, data}}
 last_best_signal_time = 0
 BEST_SIGNAL_INTERVAL = 30  # Відправляємо ОДИН найкращий сигнал раз на 30 секунд
 
+# ------------------------------------------------------
+# ⚫ BLACKLIST SYSTEM (ЧОРНИЙ СПИСОК)
+# ------------------------------------------------------
+blacklist_lock = threading.Lock()
+blacklist_file = 'blacklist.json'
+blacklist_data = {
+    "banned_symbols": [],  # Список заблокованих символів
+    "loss_counts": {}      # Лічильник збитків: {"BTC/USDT": 1}
+}
+
+def load_blacklist():
+    """Завантажує чорний список з файлу при старті"""
+    global blacklist_data
+    try:
+        if os.path.exists(blacklist_file):
+            with open(blacklist_file, 'r') as f:
+                blacklist_data = json.load(f)
+            logging.info(f"⚫ BLACKLIST: Завантажено {len(blacklist_data['banned_symbols'])} заблокованих монет")
+        else:
+            logging.info("⚫ BLACKLIST: Файл не знайдено, починаємо з чистого аркуша")
+    except Exception as e:
+        logging.error(f"❌ Помилка завантаження blacklist: {e}")
+
+def save_blacklist():
+    """Зберігає чорний список у файл"""
+    try:
+        with blacklist_lock:
+            with open(blacklist_file, 'w') as f:
+                json.dump(blacklist_data, f, indent=4)
+    except Exception as e:
+        logging.error(f"❌ Помилка збереження blacklist: {e}")
+
+def check_and_update_blacklist(symbol, pnl_pct):
+    """
+    Перевіряє, чи був це Stop Loss, і оновлює лічильник.
+    Якщо 3 збитки підряд — додає в бан.
+    """
+    # Якщо збиток більший або рівний нашому STOP_LOSS_PCT (наприклад, -3%)
+    # pnl_pct буде від'ємним числом, тому порівнюємо: -3.5 <= -3.0
+    if pnl_pct <= -STOP_LOSS_PCT:
+        with blacklist_lock:
+            # Отримуємо поточну кількість збитків
+            current_losses = blacklist_data["loss_counts"].get(symbol, 0) + 1
+            blacklist_data["loss_counts"][symbol] = current_losses
+            
+            logging.warning(f"⚠️ [{symbol}] STOP LOSS #{current_losses}! (Поріг: 3)")
+
+            if current_losses >= 3:
+                if symbol not in blacklist_data["banned_symbols"]:
+                    blacklist_data["banned_symbols"].append(symbol)
+                    logging.warning(f"⛔ [{symbol}] ДОДАНО В ЧОРНИЙ СПИСОК (3 stop-loss)")
+                    send_to_admins_and_group(f"⛔ **BLACKLIST ALERT**\nMoneta **{symbol}** отримала 3 стоп-лосси і заблокована для торгівлі.")
+            
+            save_blacklist()
+    
+    # (Опціонально) Якщо отримали Тейк-Профіт, можна скидати лічильник невдач:
+    elif pnl_pct >= TAKE_PROFIT_PCT:
+        with blacklist_lock:
+            if symbol in blacklist_data["loss_counts"] and blacklist_data["loss_counts"][symbol] > 0:
+                blacklist_data["loss_counts"][symbol] = 0
+                save_blacklist()
+                logging.info(f"♻️ [{symbol}] Лічильник збитків скинуто після успішного TP")
+# ------------------------------------------------------
+
 # 💾 ФУНКЦІЇ ЗБЕРЕЖЕННЯ/ЗАВАНТАЖЕННЯ ПОЗИЦІЙ
 def save_positions_to_file():
     """Зберігає active_positions в positions.json з захистом від race conditions"""
@@ -711,16 +775,24 @@ def monitor_open_positions():
                     positions_to_close.append((symbol, position, reason, pnl_pct))
                     continue
                 
-                # 1.1 ПЕРЕВІРКА СТОП-ЛОСС З ЛЕВЕРИДЖЕМ (ВИПРАВЛЕНО!)
-                leverage = float(position.get('leverage', LEVERAGE))
-                effective_sl_clean = STOP_LOSS_PCT / leverage  # Ефективний поріг для чистого PnL
-                if pnl_pct <= -effective_sl_clean:
-                    leveraged_pnl = pnl_pct * leverage  # Для логів
-                    logging.info(f"🚨 SLCHK [{symbol}] pnl_clean={pnl_pct:.2f}% | lev={leverage:.0f}x | SL_clean={effective_sl_clean:.2f}% | leveraged_pnl={leveraged_pnl:.1f}% → CLOSE")
-                    reason = f"SL {pnl_pct:.1f}% ≤ -{effective_sl_clean:.2f}% (leveraged: {leveraged_pnl:.1f}%)"
+                # # 1.1 ПЕРЕВІРКА СТОП-ЛОСС З ЛЕВЕРИДЖЕМ (ВИПРАВЛЕНО!)
+                # leverage = float(position.get('leverage', LEVERAGE))
+                # effective_sl_clean = STOP_LOSS_PCT / leverage  # Ефективний поріг для чистого PnL
+                # if pnl_pct <= -effective_sl_clean:
+                #     leveraged_pnl = pnl_pct * leverage  # Для логів
+                #     logging.info(f"🚨 SLCHK [{symbol}] pnl_clean={pnl_pct:.2f}% | lev={leverage:.0f}x | SL_clean={effective_sl_clean:.2f}% | leveraged_pnl={leveraged_pnl:.1f}% → CLOSE")
+                #     reason = f"SL {pnl_pct:.1f}% ≤ -{effective_sl_clean:.2f}% (leveraged: {leveraged_pnl:.1f}%)"
+                #     positions_to_close.append((symbol, position, reason, pnl_pct))
+                #     continue
+                
+                # 1.1 ПЕРЕВІРКА СТОП-ЛОСС (Виправлено на пряме порівняння)
+                # Якщо PnL (ROE) менше або дорівнює -3.0% (ваше налаштування)
+                if pnl_pct <= -STOP_LOSS_PCT:
+                    logging.info(f"🚨 SLCHK [{symbol}] PnL={pnl_pct:.2f}% ≤ -{STOP_LOSS_PCT:.2f}% → CLOSE")
+                    reason = f"SL {pnl_pct:.1f}%"
                     positions_to_close.append((symbol, position, reason, pnl_pct))
                     continue
-                
+                    
                 # 1.2 ПЕРЕВІРКА 50% РУХУ ВІД ПОЧАТКОВОГО СПРЕДУ (Nazir: додано)
                 if HALF_MOVE_CLOSE and position.get('entry_spread_pct'):
                     initial_spread_pct = abs(position.get('entry_spread_pct', 0))
@@ -819,7 +891,8 @@ def monitor_open_positions():
                     # Зберігаємо оновлені позиції ПІСЛЯ звільнення локу
                     if position_closed:
                         save_positions_to_file() # <--- ПЕРЕМІЩЕНО СЮДИ
-                    
+                        check_and_update_blacklist(symbol, pnl_pct)
+
                     # ✅ ВІДПРАВЛЯЄМО ПОВІДОМЛЕННЯ ПРО ЗАКРИТТЯ ПОЗИЦІЇ
                     close_signal = f"✅ **ПОЗИЦІЮ ЗАКРИТО!**\n"\
                                   f"📊 Символ: **{symbol.replace('/USDT:USDT', '')}** ({position['side']})\n"\
@@ -1316,6 +1389,12 @@ def symbol_worker(symbol):
     Робота по одному символу з усередненням позицій: fetch ticker, dex price via dexscreener, calc spread, check liquidity, open/average/close
     (ОДИН ПРОХІД ЗАМІСТЬ ЦИКЛУ)
     """
+    # 🔥 ДОДАНО: Перевірка Чорного Списку
+    with blacklist_lock:
+        if symbol in blacklist_data["banned_symbols"]:
+            logging.debug(f"[{symbol}] ⛔ Пропускаємо (в чорному списку)")
+            return
+
     logging.info(f"Worker starting for {symbol}") # ⬅️ ЗМІНЕНО: логування старту
     # ⛔️ ВИДАЛЕНО: while bot_running:
     try:
@@ -1573,7 +1652,8 @@ def symbol_worker(symbol):
                     logging.info(f"🔥 СИГНАЛ ЗНАЙДЕНО: {symbol} спред={xt_dex_spread_pct:.2f}% (мін={MIN_SPREAD}%, макс={MAX_SPREAD}%)")
                     
                     # 🎯 ЗБИРАЄМО ДЛЯ НАЙКРАЩИХ СИГНАЛІВ (БЕЗ КУЛДАУН ПЕРЕВІРКИ ТУТ)
-                    side = "LONG" if xt_dex_spread_pct > 0 else "SHORT"
+                    # side = "LONG" if xt_dex_spread_pct > 0 else "SHORT"
+                    side = "LONG" if xt_price < dex_price else "SHORT"
                     
                     # Розраховуємо рейтинг можливості для пошуку найкращого
                     liquidity = advanced_metrics.get('liquidity', 0)
@@ -1727,10 +1807,20 @@ def symbol_worker(symbol):
                             ok_liq = False
                         else:
                             logging.info(f"[{symbol}] {xt_liquidity_info}")
-                    
+
                     if ok_liq:
                         # ПРИМУСОВЕ встановлення левериджу ПЕРЕД кожною угодою
                         if trading_exchange == "xt":
+                            # 🔥 ДОДАНО: Встановлення ІЗОЛЬОВАНОЇ МАРЖІ
+                            try:
+                                # Спробуємо встановити isolated маржу. 
+                                # Це може викликати помилку, якщо позиція вже відкрита або режим вже встановлено, тому try/except
+                                xt.set_margin_mode('isolated', symbol)
+                                logging.info(f"[{symbol}] 🛡️ XT: Режим маржі переключено на ISOLATED")
+                            except Exception as e:
+                                # Ігноруємо помилку, якщо режим вже стоїть правильний, або просто логуємо як warning
+                                logging.warning(f"[{symbol}] ⚠️ Не вдалося явно встановити ISOLATED (можливо вже активно або є відкриті ордери): {e}")
+
                             try:
                                 # Правильний виклик з positionSide
                                 position_side = "LONG" if side == "LONG" else "SHORT"
@@ -1738,8 +1828,21 @@ def symbol_worker(symbol):
                                 logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x ({position_side})")
                             except Exception as e:
                                 logging.error(f"[{symbol}] ❌ Помилка встановлення левериджу XT: {e}")
-                                # Не блокуємо торгівлю, продовжуємо
                                 pass
+
+                    
+                    # if ok_liq:
+                    #     # ПРИМУСОВЕ встановлення левериджу ПЕРЕД кожною угодою
+                    #     if trading_exchange == "xt":
+                    #         try:
+                    #             # Правильний виклик з positionSide
+                    #             position_side = "LONG" if side == "LONG" else "SHORT"
+                    #             xt.set_leverage(LEVERAGE, symbol, {"positionSide": position_side})
+                    #             logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x ({position_side})")
+                    #         except Exception as e:
+                    #             logging.error(f"[{symbol}] ❌ Помилка встановлення левериджу XT: {e}")
+                    #             # Не блокуємо торгівлю, продовжуємо
+                    #             pass
                                 
                             # 🔒 ORDER PLACEMENT LOCK (Task 6: запобігаємо подвійним ордерам)
                             with order_placement_lock:
@@ -1887,17 +1990,33 @@ def symbol_worker(symbol):
                                         ok_liq = False
                                     else:
                                         logging.info(f"[{symbol}] УСЕРЕДНЕННЯ: {xt_avg_info}")
-                                
+
+
+                                # if ok_liq:
+                                #     # ПРИМУСОВЕ встановлення левериджу ПЕРЕД усередненням
+                                #     if trading_exchange == "xt":
+                                #         try:
+                                #             xt.set_leverage(LEVERAGE, symbol)
+                                #             logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x для усереднення")
+                                #         except Exception as e:
+                                #             logging.error(f"[{symbol}] ❌ Помилка левериджу XT при усередненні: {e}")
+                                #             pass
+
                                 if ok_liq:
                                     # ПРИМУСОВЕ встановлення левериджу ПЕРЕД усередненням
                                     if trading_exchange == "xt":
+                                        # 🔥 ДОДАНО: Встановлення ІЗОЛЬОВАНОЇ МАРЖІ для усереднення
+                                        try:
+                                            xt.set_margin_mode('isolated', symbol)
+                                        except Exception as e:
+                                            pass
+
                                         try:
                                             xt.set_leverage(LEVERAGE, symbol)
                                             logging.info(f"[{symbol}] ⚙️ XT: ПРИМУСОВО встановлено леверидж {LEVERAGE}x для усереднення")
-                                        except Exception as e:
+                                        except Exception as e:                                
                                             logging.error(f"[{symbol}] ❌ Помилка левериджу XT при усередненні: {e}")
                                             pass
-                                            
                                         # 🔒 ORDER PLACEMENT LOCK для усереднення (Task 6: запобігаємо конфліктним ордерам)
                                         with order_placement_lock:
                                             order = xt_open_market_position(xt, symbol, position['side'], add_size, LEVERAGE, ref_price, dex_price, spread_pct)
@@ -1971,20 +2090,35 @@ def symbol_worker(symbol):
             should_close = False
             close_reason = ""
             
-            # 1) ОСНОВНА ЦІЛЬ: +30% прибутку (примусове закриття)
-            if pnl_pct >= 30.0:
+            if pnl_pct >= TAKE_PROFIT_PCT:
                 should_close = True
-                close_reason = f"🎯 ДОСЯГНУТО ЦІЛЬ +30%! P&L={pnl_pct:.1f}%"
+                close_reason = f"🎯 ДОСЯГНУТО ЦІЛЬ +{TAKE_PROFIT_PCT}%! P&L={pnl_pct:.1f}%"
                 
-            # 2) ДОСТРОКОВЕ ЗАКРИТТЯ: спред зникає + прибуток 10-15%
-            elif abs(spread_pct) < 0.3 and 10.0 <= pnl_pct < 30.0:  # спред < 0.3% вважається "зниклим"
+            # 2) ДОСТРОКОВЕ ЗАКРИТТЯ: спред зникає + є хоча б половина від бажаного профіту
+            # Наприклад, якщо TP=5%, то закриє при зникненні спреду якщо є хоча б 2.5% профіту
+            elif abs(spread_pct) < 0.3 and (TAKE_PROFIT_PCT / 2) <= pnl_pct: 
                 should_close = True
-                close_reason = f"⚡ ДОСТРОКОВЕ ЗАКРИТТЯ: спред зник ({abs(spread_pct):.2f}% < 0.3%) + прибуток {pnl_pct:.1f}% (в межах 10-30%)"
+                close_reason = f"⚡ ДОСТРОКОВЕ ЗАКРИТТЯ: спред зник + прибуток {pnl_pct:.1f}%"
                 
-            # 3) ЗАХИСТ: спред > 30% (як було раніше)
+            # 3) ЗАХИСТ: спред > 30% (аномалія)
             elif abs(spread_pct) >= 30.0:
                 should_close = True 
                 close_reason = f"🚨 АВАРІЙНЕ ЗАКРИТТЯ: спред {abs(spread_pct):.2f}% >= 30%"
+                
+            # # 1) ОСНОВНА ЦІЛЬ: +30% прибутку (примусове закриття)
+            # if pnl_pct >= 30.0:
+            #     should_close = True
+            #     close_reason = f"🎯 ДОСЯГНУТО ЦІЛЬ +30%! P&L={pnl_pct:.1f}%"
+                
+            # # 2) ДОСТРОКОВЕ ЗАКРИТТЯ: спред зникає + прибуток 10-15%
+            # elif abs(spread_pct) < 0.3 and 10.0 <= pnl_pct < 30.0:  # спред < 0.3% вважається "зниклим"
+            #     should_close = True
+            #     close_reason = f"⚡ ДОСТРОКОВЕ ЗАКРИТТЯ: спред зник ({abs(spread_pct):.2f}% < 0.3%) + прибуток {pnl_pct:.1f}% (в межах 10-30%)"
+                
+            # # 3) ЗАХИСТ: спред > 30% (як було раніше)
+            # elif abs(spread_pct) >= 30.0:
+            #     should_close = True 
+            #     close_reason = f"🚨 АВАРІЙНЕ ЗАКРИТТЯ: спред {abs(spread_pct):.2f}% >= 30%"
             
             if should_close:
                 logging.warning(f"🚨 АВТОЗАКРИТТЯ {position['side']} {symbol}: {close_reason}")
@@ -3323,7 +3457,9 @@ if __name__ == "__main__":
     # 💾 ЗАВАНТАЖУЄМО ЗБЕРЕЖЕНІ ПОЗИЦІЇ при старті
     logging.info("💾 Завантаження збережених позицій...")
     load_positions_from_file()
-    
+
+    logging.info("💾 Завантаження чорного списку...")
+    load_blacklist()
     # 🤖 Запуск Telegram адмін-бота в окремому процесі
     try:
         from multiprocessing import Process
